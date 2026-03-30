@@ -117,6 +117,15 @@ interface LogDetails {
   wallClockSeconds: number | null;
 }
 
+interface StagnationSnapshot {
+  recommendation: "continue" | "research" | "blocked";
+  trailingNonKeep: number;
+  trailingNoCode: number;
+  trailingAnalysisOnly: number;
+  lastKeepRun: number | null;
+  summary: string;
+}
+
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
   dashboardExpanded: boolean;
@@ -128,6 +137,7 @@ interface AutoresearchRuntime {
   runningExperiment: { startedAt: number; command: string } | null;
   state: ExperimentState;
   recoveryNotice: string | null;
+  stagnation: StagnationSnapshot | null;
   /** Context tokens at the start of the current run_experiment call. null if not running. */
   iterationStartTokens: number | null;
   /** Token cost of each completed iteration (for predicting context exhaustion). */
@@ -157,6 +167,7 @@ interface PersistedAutoresearchState {
   git: GitContext;
   runningExperiment: { startedAt: number; command: string } | null;
   recoveryNotice: string | null;
+  stagnation: StagnationSnapshot | null;
   summary: {
     name: string | null;
     metricName: string;
@@ -625,6 +636,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     runningExperiment: null,
     state: createExperimentState(),
     recoveryNotice: null,
+    stagnation: null,
     iterationStartTokens: null,
     iterationTokenHistory: [],
   };
@@ -686,6 +698,85 @@ function getRuntimeStatePath(workDir: string): string {
   return path.join(workDir, "autoresearch.state.json");
 }
 
+function getResearchCheckpointPath(workDir: string): string {
+  return path.join(workDir, "autoresearch.research.md");
+}
+
+function isAnalysisOnlyResult(result: ExperimentResult): boolean {
+  const description = result.description.toLowerCase();
+  return result.metrics?.analysis_only === 1
+    || description.includes("analysis-only")
+    || description.includes("trace-analysis")
+    || description.includes("analysis cycle")
+    || description.includes("no benchmark run");
+}
+
+function isNoCodeResult(result: ExperimentResult): boolean {
+  const description = result.description.toLowerCase();
+  return isAnalysisOnlyResult(result)
+    || description.includes("no-code")
+    || description.includes("no code change")
+    || description.includes("unchanged control")
+    || description.includes("calibration")
+    || description.includes("baseline recovery noise");
+}
+
+function computeStagnationSnapshot(workDir: string, runtime: AutoresearchRuntime): StagnationSnapshot | null {
+  const current = currentResults(runtime.state.results, runtime.state.currentSegment);
+  if (current.length === 0) return null;
+
+  let trailingNonKeep = 0;
+  let trailingNoCode = 0;
+  let trailingAnalysisOnly = 0;
+  let lastKeepRun: number | null = null;
+
+  for (let i = current.length - 1; i >= 0; i--) {
+    const result = current[i];
+    if (result.status === "keep") {
+      lastKeepRun = runtime.state.results.findIndex((candidate) => candidate === result) + 1;
+      break;
+    }
+    trailingNonKeep++;
+  }
+
+  for (let i = current.length - 1; i >= 0; i--) {
+    if (!isNoCodeResult(current[i])) break;
+    trailingNoCode++;
+  }
+
+  for (let i = current.length - 1; i >= 0; i--) {
+    if (!isAnalysisOnlyResult(current[i])) break;
+    trailingAnalysisOnly++;
+  }
+
+  const researchExists = fs.existsSync(getResearchCheckpointPath(workDir));
+  const stagnant = trailingAnalysisOnly >= 3 || trailingNoCode >= 5 || trailingNonKeep >= 8;
+  if (!stagnant) {
+    return {
+      recommendation: "continue",
+      trailingNonKeep,
+      trailingNoCode,
+      trailingAnalysisOnly,
+      lastKeepRun,
+      summary: `Loop still has room to search (non-keep tail ${trailingNonKeep}, no-code tail ${trailingNoCode}, analysis tail ${trailingAnalysisOnly}).`,
+    };
+  }
+
+  const recommendation = researchExists ? "blocked" : "research";
+  const summary = recommendation === "research"
+    ? `Stagnation detected: ${trailingNonKeep} non-keep runs, ${trailingNoCode} consecutive no-code cycles, ${trailingAnalysisOnly} consecutive analysis-only cycles. Run a research checkpoint before another experiment.`
+    : `Stagnation persists after a research checkpoint file already exists. Treat the loop as blocked/saturated unless a concretely better hypothesis appears.`;
+
+  return {
+    recommendation,
+    trailingNonKeep,
+    trailingNoCode,
+    trailingAnalysisOnly,
+    lastKeepRun,
+    summary,
+  };
+}
+
 function readPersistedRuntimeState(workDir: string): PersistedAutoresearchState | null {
   try {
     const statePath = getRuntimeStatePath(workDir);
@@ -723,6 +814,7 @@ function collectHealthChecks(workDir: string, runtime: AutoresearchRuntime): Hea
 
 function summarizeRuntimeState(workDir: string, sessionId: string, runtime: AutoresearchRuntime): PersistedAutoresearchState {
   const current = currentResults(runtime.state.results, runtime.state.currentSegment);
+  runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
   return {
     version: 1,
     updatedAt: Date.now(),
@@ -733,6 +825,7 @@ function summarizeRuntimeState(workDir: string, sessionId: string, runtime: Auto
     git: inspectGitContext(workDir),
     runningExperiment: runtime.runningExperiment,
     recoveryNotice: runtime.recoveryNotice,
+    stagnation: runtime.stagnation,
     summary: {
       name: runtime.state.name,
       metricName: runtime.state.metricName,
@@ -1043,6 +1136,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     "autoresearch.jsonl",
     "autoresearch.md",
     "autoresearch.ideas.md",
+    "autoresearch.research.md",
     "autoresearch.sh",
     "autoresearch.checks.sh",
   ];
@@ -1086,11 +1180,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [status|resume [text]|off|clear|<text>]",
+      "Usage: /autoresearch [status|research [text]|resume [text]|off|clear|<text>]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
-      "status shows mode, git/worktree health, and current progress.",
+      "status shows mode, git/worktree health, stagnation state, and current progress.",
+      "research starts a research-checkpoint turn before another experiment.",
       "resume re-enters autoresearch mode using existing session files.",
       "clear deletes autoresearch.jsonl and autoresearch.state.json, then turns autoresearch mode off.",
       "",
@@ -1149,14 +1244,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               continue;
             }
 
-            // Experiment result line
+            // Experiment-like result line
+            if (typeof entry.status !== "string" || typeof entry.description !== "string") {
+              continue;
+            }
+
             const iterationTokens = entry.iterationTokens ?? null;
             state.results.push({
               commit: entry.commit ?? "",
               metric: entry.metric ?? 0,
               metrics: entry.metrics ?? {},
-              status: entry.status ?? "keep",
-              description: entry.description ?? "",
+              status: entry.status,
+              description: entry.description,
               timestamp: entry.timestamp ?? 0,
               segment,
               confidence: entry.confidence ?? null,
@@ -1233,6 +1332,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ctx.ui.notify(runtime.recoveryNotice, "warning");
       }
     }
+
+    runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
 
     updateWidget(ctx);
     persistRuntimeState(ctx);
@@ -1429,11 +1530,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // The agent reads autoresearch.md on startup which has all context
     const workDir = resolveWorkDir(ctx.cwd);
     const ideasPath = path.join(workDir, "autoresearch.ideas.md");
+    const researchPath = getResearchCheckpointPath(workDir);
     const hasIdeas = fs.existsSync(ideasPath);
+    const hasResearch = fs.existsSync(researchPath);
+    runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
 
     let resumeMsg = "Autoresearch loop ended (likely context limit). Resume the experiment loop — read autoresearch.md and git log for context.";
     if (hasIdeas) {
       resumeMsg += " Check autoresearch.ideas.md for promising paths to explore. Prune stale/tried ideas.";
+    }
+    if (runtime.stagnation?.recommendation === "research") {
+      resumeMsg += ` The loop is stagnating. Before another experiment, create or update ${researchPath} with a research checkpoint and only run a new experiment if that produces a materially new idea.`;
+    } else if (runtime.stagnation?.recommendation === "blocked") {
+      resumeMsg += hasResearch
+        ? ` A research checkpoint already exists at ${researchPath} and the loop still looks stagnant. Do not run another blind calibration; either promote one explicitly research-backed experiment or stop as blocked/saturated.`
+        : " The loop still looks blocked/saturated. Do not run another blind calibration without a materially new hypothesis.";
     }
     resumeMsg += ` ${BENCHMARK_GUARDRAIL}`;
 
@@ -1451,7 +1562,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const workDir = resolveWorkDir(ctx.cwd);
     const mdPath = path.join(workDir, "autoresearch.md");
     const ideasPath = path.join(workDir, "autoresearch.ideas.md");
+    const researchPath = getResearchCheckpointPath(workDir);
     const hasIdeas = fs.existsSync(ideasPath);
+    const hasResearch = fs.existsSync(researchPath);
+    runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
 
     const checksPath = path.join(workDir, "autoresearch.checks.sh");
     const hasChecks = fs.existsSync(checksPath);
@@ -1477,6 +1591,27 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     if (hasIdeas) {
       extra += `\n\n💡 Ideas backlog exists at ${ideasPath} — check it for promising experiment paths. Prune stale entries.`;
+    }
+
+    if (hasResearch) {
+      extra += `\n📚 Research checkpoint file exists at ${researchPath} — read it before choosing the next experiment.`;
+    }
+
+    if (runtime.stagnation && runtime.stagnation.recommendation !== "continue") {
+      extra +=
+        "\n\n## Stagnation Checkpoint" +
+        `\n${runtime.stagnation.summary}`;
+
+      if (runtime.stagnation.recommendation === "research") {
+        extra +=
+          `\nBefore another experiment, create or update ${researchPath}.` +
+          "\nDo a research checkpoint first: summarize the repeated local dead ends, use any available docs/web/code research tools to gather 3-5 fresh external findings, write the findings to autoresearch.research.md, and distill only the best 1-3 new hypotheses into autoresearch.ideas.md." +
+          "\nOnly run a new experiment in this session if that research produces a materially new, evidence-backed idea.";
+      } else {
+        extra +=
+          `\nA research checkpoint file already exists at ${researchPath} and the loop still looks stagnant.` +
+          "\nDo not do another blind calibration run. Either promote one explicitly research-backed experiment or state that the benchmark is blocked/saturated and stop the loop.";
+      }
     }
 
     return {
@@ -2711,7 +2846,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
 
   pi.registerCommand("autoresearch", {
-    description: "Start, stop, clear, show status, or resume autoresearch mode",
+    description: "Start, stop, clear, status-check, or research-checkpoint autoresearch mode",
     handler: async (args, ctx) => {
       const runtime = getRuntime(ctx);
       const trimmedArgs = (args ?? "").trim();
@@ -2745,6 +2880,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (runtime.recoveryNotice) {
           lines.push(`Recovery: ${runtime.recoveryNotice}`);
         }
+        runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
+        if (runtime.stagnation && runtime.stagnation.recommendation !== "continue") {
+          lines.push(`Stagnation: ${runtime.stagnation.recommendation}`);
+          lines.push(`Stagnation summary: ${runtime.stagnation.summary}`);
+          lines.push(`Research file: ${fs.existsSync(getResearchCheckpointPath(workDir)) ? "present" : "missing"}`);
+        }
         if (persisted && !runtime.runningExperiment) {
           lines.push(`Persisted state: ${persisted.status} (updated ${new Date(persisted.updatedAt).toLocaleString()})`);
         }
@@ -2752,6 +2893,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           lines.push("", ...formatHealthChecks(healthChecks));
         }
         ctx.ui.notify(lines.join("\n"), healthChecks.some((check) => check.level === "error") ? "warning" : "info");
+        return;
+      }
+
+      if (lowerArgs === "research" || lowerArgs.startsWith("research ")) {
+        const researchPrompt = trimmedArgs.replace(/^research\s*/i, "").trim();
+        runtime.autoresearchMode = true;
+        runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
+        persistRuntimeState(ctx);
+        ctx.ui.notify("Autoresearch research checkpoint queued", "info");
+        pi.sendUserMessage(
+          `Autoresearch research checkpoint. Read autoresearch.md, autoresearch.ideas.md, and ${getResearchCheckpointPath(workDir)} if it exists. Summarize the repeated dead ends, use any available docs/web/code research tools to gather fresh external findings, write/update autoresearch.research.md, distill the best 1-3 new hypotheses into autoresearch.ideas.md, and only then decide whether one new experiment is justified. ${researchPrompt} ${BENCHMARK_GUARDRAIL}`.trim()
+        );
         return;
       }
 
