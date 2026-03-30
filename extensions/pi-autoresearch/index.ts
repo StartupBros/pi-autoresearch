@@ -70,6 +70,26 @@ interface MetricDef {
   unit: string;
 }
 
+interface LessonEntry {
+  run: number;
+  segment: number;
+  timestamp: number;
+  commit: string;
+  status: ExperimentResult["status"];
+  metricName: string;
+  metricUnit: string;
+  metric: number;
+  metrics: Record<string, number>;
+  description: string;
+  hypothesis?: string;
+  learned?: string;
+  rollbackReason?: string;
+  nextActionHint?: string;
+  analysisOnly?: boolean;
+  tags: string[];
+  asi?: ASI;
+}
+
 interface ExperimentState {
   results: ExperimentResult[];
   /** Baseline primary metric (from first experiment in current segment) */
@@ -702,6 +722,10 @@ function getResearchCheckpointPath(workDir: string): string {
   return path.join(workDir, "autoresearch.research.md");
 }
 
+function getLessonsPath(workDir: string): string {
+  return path.join(workDir, "autoresearch.lessons.jsonl");
+}
+
 function isAnalysisOnlyResult(result: ExperimentResult): boolean {
   const description = result.description.toLowerCase();
   return result.metrics?.analysis_only === 1
@@ -719,6 +743,56 @@ function isNoCodeResult(result: ExperimentResult): boolean {
     || description.includes("unchanged control")
     || description.includes("calibration")
     || description.includes("baseline recovery noise");
+}
+
+function normalizeLessonValue(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+  return undefined;
+}
+
+function buildLessonEntry(run: number, state: ExperimentState, experiment: ExperimentResult): LessonEntry | null {
+  const asi = experiment.asi ?? {};
+  const hypothesis = normalizeLessonValue(asi.hypothesis);
+  const learned = normalizeLessonValue(asi.learned);
+  const rollbackReason = normalizeLessonValue(asi.rollback_reason);
+  const nextActionHint = normalizeLessonValue(asi.next_action_hint);
+  const analysisOnly = isAnalysisOnlyResult(experiment);
+
+  if (!hypothesis && !learned && !rollbackReason && !nextActionHint && experiment.status === "keep" && !analysisOnly) {
+    return null;
+  }
+
+  const tags = [experiment.status];
+  if (analysisOnly) tags.push("analysis_only");
+  if (isNoCodeResult(experiment)) tags.push("no_code");
+  if (experiment.status !== "keep") tags.push("rollback");
+
+  return {
+    run,
+    segment: experiment.segment,
+    timestamp: experiment.timestamp,
+    commit: experiment.commit,
+    status: experiment.status,
+    metricName: state.metricName,
+    metricUnit: state.metricUnit,
+    metric: experiment.metric,
+    metrics: { ...experiment.metrics },
+    description: experiment.description,
+    hypothesis,
+    learned,
+    rollbackReason,
+    nextActionHint,
+    analysisOnly,
+    tags,
+    asi: experiment.asi,
+  };
+}
+
+function appendLessonEntry(workDir: string, lesson: LessonEntry): void {
+  fs.appendFileSync(getLessonsPath(workDir), JSON.stringify(lesson) + "\n");
 }
 
 function computeStagnationSnapshot(workDir: string, runtime: AutoresearchRuntime): StagnationSnapshot | null {
@@ -1134,6 +1208,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const AUTORESEARCH_SESSION_FILES = [
     "autoresearch.state.json",
     "autoresearch.jsonl",
+    "autoresearch.lessons.jsonl",
     "autoresearch.md",
     "autoresearch.ideas.md",
     "autoresearch.research.md",
@@ -1563,8 +1638,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const mdPath = path.join(workDir, "autoresearch.md");
     const ideasPath = path.join(workDir, "autoresearch.ideas.md");
     const researchPath = getResearchCheckpointPath(workDir);
+    const lessonsPath = getLessonsPath(workDir);
     const hasIdeas = fs.existsSync(ideasPath);
     const hasResearch = fs.existsSync(researchPath);
+    const hasLessons = fs.existsSync(lessonsPath);
     runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
 
     const checksPath = path.join(workDir, "autoresearch.checks.sh");
@@ -1591,6 +1668,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     if (hasIdeas) {
       extra += `\n\n💡 Ideas backlog exists at ${ideasPath} — check it for promising experiment paths. Prune stale entries.`;
+    }
+
+    if (hasLessons) {
+      extra += `\n🧠 Lessons memory exists at ${lessonsPath} — mine it for dead ends, durable learnings, and next-action hints before repeating old work.`;
     }
 
     if (hasResearch) {
@@ -2516,6 +2597,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         fs.appendFileSync(jsonlPath, JSON.stringify(jsonlEntry) + "\n");
       } catch (e) {
         text += `\n⚠️ Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`;
+      }
+
+      try {
+        const lesson = buildLessonEntry(state.results.length, state, experiment);
+        if (lesson) {
+          appendLessonEntry(workDir, lesson);
+          text += `\n🧠 Lesson captured in autoresearch.lessons.jsonl`;
+        }
+      } catch (e) {
+        text += `\n⚠️ Failed to write autoresearch.lessons.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
 
       // Auto-revert on discard/crash/checks_failed — revert all files except autoresearch session files

@@ -86,6 +86,7 @@ pi install https://github.com/davebcn87/pi-autoresearch
 | `autoresearch.sh` | Benchmark script — pre-checks, runs the workload, outputs `METRIC name=number` lines. |
 | `autoresearch.checks.sh` | *(optional)* Backpressure checks — tests, types, lint. Runs after each passing benchmark. Failures block `keep`. |
 | `autoresearch.state.json` | Lightweight runtime snapshot — mode, git/worktree health, running command, recovery hints, stagnation state, and progress summary for crash/reload-safe resume. |
+| `autoresearch.lessons.jsonl` | Structured memory of reusable lessons from experiment runs — hypotheses, learnings, rollback reasons, and next-action hints that survive reverts. |
 | `autoresearch.research.md` | Research-checkpoint notes — repeated dead ends, external findings, and fresh hypotheses to try when the local search stagnates. |
 
 ---
@@ -175,16 +176,17 @@ The **extension** is domain-agnostic infrastructure. The **skill** encodes domai
 └──────────────────────┘     └──────────────────────────┘
 ```
 
-Four files keep the session alive across restarts, stagnation pivots, and context resets:
+Five files keep the session alive across restarts, stagnation pivots, and context resets:
 
 ```
 autoresearch.jsonl        — append-only log of every run (metric, status, commit, description)
 autoresearch.md           — living document: objective, what's been tried, dead ends, key wins
 autoresearch.state.json   — crash/reload-safe runtime snapshot (mode, git/worktree status, running command)
+autoresearch.lessons.jsonl — structured reusable lessons from prior runs
 autoresearch.research.md  — research-checkpoint findings and fresh hypotheses when local search stalls
 ```
 
-A fresh agent with no memory can read these files and continue exactly where the previous session left off, while `autoresearch.state.json` helps detect interrupted runs and `autoresearch.research.md` captures the external-research pivot when the loop stagnates.
+A fresh agent with no memory can read these files and continue exactly where the previous session left off, while `autoresearch.state.json` helps detect interrupted runs, `autoresearch.lessons.jsonl` preserves durable strategy memory across reverts, and `autoresearch.research.md` captures the external-research pivot when the loop stagnates.
 
 ---
 

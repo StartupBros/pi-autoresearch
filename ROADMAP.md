@@ -19,7 +19,7 @@ Turn `pi-autoresearch` into a top-tier Pi-native autonomous optimization harness
 
 ## Phase 2 — smarter loop control
 - [x] Stagnation detection (`research`, `blocked` recommendations)
-- [ ] `autoresearch.lessons.jsonl` strategy memory
+- [x] `autoresearch.lessons.jsonl` strategy memory
 - [x] Research checkpoint flow using repo analysis + docs/web search prompts
 - [ ] Better mismatch detection between branch state and experiment log
 

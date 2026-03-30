@@ -406,7 +406,7 @@ print_summary() {
   echo "Cleanup — after merging, delete the autoresearch branch and session files:"
   echo ""
   echo "  git branch -D $ORIG_BRANCH"
-  echo "  rm -f autoresearch.jsonl autoresearch.state.json autoresearch.sh autoresearch.md autoresearch.ideas.md autoresearch.research.md"
+  echo "  rm -f autoresearch.jsonl autoresearch.state.json autoresearch.lessons.jsonl autoresearch.sh autoresearch.md autoresearch.ideas.md autoresearch.research.md"
 
   if [ -f "autoresearch.ideas.md" ]; then
     echo ""
