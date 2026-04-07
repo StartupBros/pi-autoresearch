@@ -45,8 +45,11 @@ pi install https://github.com/davebcn87/pi-autoresearch
 | Subcommand | Description |
 |------------|-------------|
 | `/autoresearch <text>` | Enter autoresearch mode. If `autoresearch.md` exists, resumes the loop with `<text>` as context. Otherwise, sets up a new session. |
+| `/autoresearch resume [text]` | Re-enter autoresearch mode using existing session files and optionally provide fresh steering context. |
+| `/autoresearch research [text]` | Force a research-checkpoint turn: summarize stagnation, gather external findings, update `autoresearch.research.md`, and only then justify a new experiment. |
+| `/autoresearch status` | Show current mode, worktree/git health, persisted state, stagnation state, and current progress summary. |
 | `/autoresearch off` | Leave autoresearch mode. Stops auto-resume and clears runtime state but keeps `autoresearch.jsonl` intact. |
-| `/autoresearch clear` | Delete `autoresearch.jsonl`, reset all state, and turn autoresearch mode off. Use this for a clean start. |
+| `/autoresearch clear` | Delete `autoresearch.jsonl` and `autoresearch.state.json`, reset all state, and turn autoresearch mode off. Use this for a clean start. |
 | `/autoresearch export` | Open a live dashboard in your browser. Auto-updates as experiments run. |
 
 **Examples:**
@@ -84,6 +87,9 @@ pi install https://github.com/davebcn87/pi-autoresearch
 | `autoresearch.md` | Session document — objective, metrics, files in scope, what's been tried. A fresh agent can resume from this alone. |
 | `autoresearch.sh` | Benchmark script — pre-checks, runs the workload, outputs `METRIC name=number` lines. |
 | `autoresearch.checks.sh` | *(optional)* Backpressure checks — tests, types, lint. Runs after each passing benchmark. Failures block `keep`. |
+| `autoresearch.state.json` | Lightweight runtime snapshot — mode, git/worktree health, running command, recovery hints, stagnation state, and progress summary for crash/reload-safe resume. |
+| `autoresearch.lessons.jsonl` | Structured memory of reusable lessons from experiment runs — hypotheses, learnings, rollback reasons, and next-action hints that survive reverts. |
+| `autoresearch.research.md` | Research-checkpoint notes — repeated dead ends, external findings, and fresh hypotheses to try when the local search stagnates. |
 
 ---
 
@@ -173,14 +179,17 @@ The **extension** is domain-agnostic infrastructure. The **skill** encodes domai
 └──────────────────────┘     └──────────────────────────┘
 ```
 
-Two files keep the session alive across restarts and context resets:
+Five files keep the session alive across restarts, stagnation pivots, and context resets:
 
 ```
-autoresearch.jsonl   — append-only log of every run (metric, status, commit, description)
-autoresearch.md      — living document: objective, what's been tried, dead ends, key wins
+autoresearch.jsonl        — append-only log of every run (metric, status, commit, description)
+autoresearch.md           — living document: objective, what's been tried, dead ends, key wins
+autoresearch.state.json   — crash/reload-safe runtime snapshot (mode, git/worktree status, running command)
+autoresearch.lessons.jsonl — structured reusable lessons from prior runs
+autoresearch.research.md  — research-checkpoint findings and fresh hypotheses when local search stalls
 ```
 
-A fresh agent with no memory can read these two files and continue exactly where the previous session left off.
+A fresh agent with no memory can read these files and continue exactly where the previous session left off, while `autoresearch.state.json` helps detect interrupted runs, `autoresearch.lessons.jsonl` preserves durable strategy memory across reverts, and `autoresearch.research.md` captures the external-research pivot when the loop stagnates.
 
 ---
 
