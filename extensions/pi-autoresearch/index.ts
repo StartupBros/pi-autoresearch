@@ -8,7 +8,7 @@
  * - `run_experiment` tool — runs any command, times it, captures output, detects pass/fail
  * - `log_experiment` tool — records results with session-persisted state
  * - Status widget showing experiment count + best metric
- * - Ctrl+X toggle to expand/collapse full dashboard inline above the editor
+ * - Configurable shortcuts to expand/collapse and fullscreen the dashboard
  * - Adds autoresearch guidance to the system prompt and points the agent at autoresearch.md
  * - Injects autoresearch.md into context on every turn via before_agent_start
  */
@@ -16,6 +16,7 @@
 import type {
   ExtensionAPI,
   ExtensionContext,
+  SessionBeforeCompactEvent,
   Theme,
 } from "@mariozechner/pi-coding-agent";
 import { truncateTail, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "@mariozechner/pi-coding-agent";
@@ -26,10 +27,30 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type Server, type ServerResponse } from "node:http";
-import { spawn, spawnSync } from "node:child_process";
+
+import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
+
+import {
+  runHook,
+  steerMessageFor,
+  appendHookLogEntryIfConfigured,
+  type HookPayload,
+  type SessionSnapshot,
+} from "./hooks.ts";
+import {
+  parseJsonlEntry,
+  isAutoresearchRunEntry,
+  extractAutoresearchSessionName,
+  reconstructJsonlState,
+} from "./jsonl.ts";
+import {
+  autoresearchSummaryPathsFor,
+  buildAutoresearchCompactionSummary,
+} from "./compaction.ts";
+import { resolveAutoresearchShortcuts } from "./shortcuts.ts";
 
 // ---------------------------------------------------------------------------
 // Experiment output limits (sent to LLM — keep small to save context)
@@ -61,8 +82,6 @@ interface ExperimentResult {
   segment: number;
   /** Session-level confidence score at the time this result was logged. null if insufficient data. */
   confidence: number | null;
-  /** Context tokens consumed during this iteration (from run_experiment to log_experiment). null if unavailable. */
-  iterationTokens: number | null;
   /** Actionable Side Information — structured diagnostics for this run */
   asi?: ASI;
 }
@@ -70,26 +89,6 @@ interface ExperimentResult {
 interface MetricDef {
   name: string;
   unit: string;
-}
-
-interface LessonEntry {
-  run: number;
-  segment: number;
-  timestamp: number;
-  commit: string;
-  status: ExperimentResult["status"];
-  metricName: string;
-  metricUnit: string;
-  metric: number;
-  metrics: Record<string, number>;
-  description: string;
-  hypothesis?: string;
-  learned?: string;
-  rollbackReason?: string;
-  nextActionHint?: string;
-  analysisOnly?: boolean;
-  tags: string[];
-  asi?: ASI;
 }
 
 interface ExperimentState {
@@ -139,70 +138,19 @@ interface LogDetails {
   wallClockSeconds: number | null;
 }
 
-interface StagnationSnapshot {
-  recommendation: "continue" | "research" | "blocked";
-  trailingNonKeep: number;
-  trailingNoCode: number;
-  trailingAnalysisOnly: number;
-  lastKeepRun: number | null;
-  summary: string;
-}
-
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
   dashboardExpanded: boolean;
-  lastAutoResumeTime: number;
   experimentsThisSession: number;
   autoResumeTurns: number;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
   lastRunDuration: number | null;
   runningExperiment: { startedAt: number; command: string } | null;
   state: ExperimentState;
-  recoveryNotice: string | null;
-  stagnation: StagnationSnapshot | null;
-  /** Context tokens at the start of the current run_experiment call. null if not running. */
-  iterationStartTokens: number | null;
-  /** Token cost of each completed iteration (for predicting context exhaustion). */
-  iterationTokenHistory: number[];
-}
-
-interface GitContext {
-  repoRoot: string | null;
-  branch: string | null;
-  isWorktree: boolean;
-  detached: boolean;
-  dirty: boolean;
-}
-
-interface HealthCheck {
-  level: "warning" | "error";
-  message: string;
-}
-
-interface PersistedAutoresearchState {
-  version: number;
-  updatedAt: number;
-  autoresearchMode: boolean;
-  status: "off" | "idle" | "running";
-  workDir: string;
-  sessionId: string;
-  git: GitContext;
-  runningExperiment: { startedAt: number; command: string } | null;
-  recoveryNotice: string | null;
-  stagnation: StagnationSnapshot | null;
-  summary: {
-    name: string | null;
-    metricName: string;
-    metricUnit: string;
-    bestDirection: "lower" | "higher";
-    runs: number;
-    kept: number;
-    crashed: number;
-    checksFailed: number;
-    baselineMetric: number | null;
-    confidence: number | null;
-    maxExperiments: number | null;
-  };
+  /** Pending auto-resume timer; cancelled when the agent starts a new run or compacts. */
+  pendingResumeTimer: ReturnType<typeof setTimeout> | null;
+  /** Resume message to send when the pending timer fires. */
+  pendingResumeMessage: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +198,7 @@ const InitParams = Type.Object({
   ),
 });
 
-const LogParams = Type.Object({
+export const LogParams = Type.Object({
   commit: Type.String({ description: "Git commit hash (short, 7 chars)" }),
   metric: Type.Number({
     description:
@@ -261,7 +209,8 @@ const LogParams = Type.Object({
     description: "Short description of what this experiment tried",
   }),
   metrics: Type.Optional(
-    Type.Record(Type.String(), Type.Number(), {
+    Type.Object({}, {
+      additionalProperties: Type.Number(),
       description:
         'Additional metrics to track as { name: value } pairs, e.g. { "compile_µs": 4200, "render_µs": 9800 }. These are shown alongside the primary metric for tradeoff monitoring.',
     })
@@ -273,7 +222,8 @@ const LogParams = Type.Object({
     })
   ),
   asi: Type.Optional(
-    Type.Record(Type.String(), Type.Unknown(), {
+    Type.Object({}, {
+      additionalProperties: Type.Unknown(),
       description:
         'Actionable Side Information — structured diagnostics for this run. Free-form key/value pairs. Parsed ASI from run_experiment output is merged automatically; use this to add or override fields.',
     })
@@ -420,49 +370,6 @@ function isBetter(
   return direction === "lower" ? current < best : current > best;
 }
 
-// Why 1.2: iterations vary in cost; 20% buffer prevents overflow on heavier iterations
-const CONTEXT_SAFETY_MARGIN = 1.2;
-
-function estimateTokensPerIteration(history: number[]): number {
-  const mean = history.reduce((a, b) => a + b, 0) / history.length;
-  const sorted = [...history].sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)];
-  // Why max(mean, median): outlier-heavy runs inflate the mean, skewed runs inflate the median.
-  // Taking the larger gives a conservative estimate that handles both distributions.
-  return Math.max(mean, median);
-}
-
-function hasRoomForNextIteration(history: number[], currentTokens: number, contextWindow: number): boolean {
-  if (history.length < 1) return true;
-  const projectedTokens = currentTokens + estimateTokensPerIteration(history) * CONTEXT_SAFETY_MARGIN;
-  return projectedTokens <= contextWindow;
-}
-
-function recordIterationTokens(runtime: AutoresearchRuntime, currentTokens: number | null): void {
-  if (runtime.iterationStartTokens == null || currentTokens == null) return;
-  const tokensConsumed = currentTokens - runtime.iterationStartTokens;
-  if (tokensConsumed <= 0) return;
-  runtime.iterationTokenHistory.push(tokensConsumed);
-}
-
-function lastIterationTokens(runtime: AutoresearchRuntime): number | null {
-  if (runtime.iterationTokenHistory.length === 0) return null;
-  return runtime.iterationTokenHistory[runtime.iterationTokenHistory.length - 1];
-}
-
-function advanceIterationTracking(runtime: AutoresearchRuntime, ctx: ExtensionContext): void {
-  const usage = ctx.getContextUsage();
-  if (usage?.tokens == null) return;
-  recordIterationTokens(runtime, usage.tokens);
-  runtime.iterationStartTokens = usage.tokens;
-}
-
-function isContextExhausted(runtime: AutoresearchRuntime, ctx: ExtensionContext): boolean {
-  const usage = ctx.getContextUsage();
-  if (usage?.tokens == null) return false;
-  return !hasRoomForNextIteration(runtime.iterationTokenHistory, usage.tokens, usage.contextWindow);
-}
-
 /** Compute the median of a numeric array (returns 0 for empty arrays) */
 function sortedMedian(values: number[]): number {
   if (values.length === 0) return 0;
@@ -529,7 +436,7 @@ interface AutoresearchConfig {
 /** Read autoresearch.config.json from the given directory (always ctx.cwd) */
 function readConfig(cwd: string): AutoresearchConfig {
   try {
-    const configPath = path.join(cwd, "autoresearch.config.json");
+    const configPath = autoresearchConfigPath(cwd);
     if (!fs.existsSync(configPath)) return {};
     return JSON.parse(fs.readFileSync(configPath, "utf-8"));
   } catch {
@@ -581,6 +488,30 @@ function findBaselineMetric(results: ExperimentResult[], segment: number): numbe
   const cur = currentResults(results, segment);
   return cur.length > 0 ? cur[0].metric : null;
 }
+
+/** Best = optimal metric across kept experiments in current segment (min for lower, max for higher) */
+function findBestMetric(
+  results: ExperimentResult[],
+  segment: number,
+  direction: "lower" | "higher",
+): number | null {
+  const kept = currentResults(results, segment)
+    .filter((r) => r.status === "keep")
+    .map((r) => r.metric);
+  if (kept.length === 0) return null;
+  return direction === "lower" ? Math.min(...kept) : Math.max(...kept);
+}
+
+// -----------------------------------------------------------------------
+// Session file paths (single source of truth for autoresearch.* filenames)
+// -----------------------------------------------------------------------
+
+const autoresearchJsonlPath  = (dir: string) => path.join(dir, "autoresearch.jsonl");
+const autoresearchMdPath     = (dir: string) => path.join(dir, "autoresearch.md");
+const autoresearchIdeasPath  = (dir: string) => path.join(dir, "autoresearch.ideas.md");
+const autoresearchChecksPath = (dir: string) => path.join(dir, "autoresearch.checks.sh");
+const autoresearchScriptPath = (dir: string) => path.join(dir, "autoresearch.sh");
+const autoresearchConfigPath = (dir: string) => path.join(dir, "autoresearch.config.json");
 
 function findBaselineRunNumber(results: ExperimentResult[], segment: number): number | null {
   const index = results.findIndex((result) => result.segment === segment);
@@ -703,17 +634,14 @@ function createSessionRuntime(): AutoresearchRuntime {
   return {
     autoresearchMode: false,
     dashboardExpanded: false,
-    lastAutoResumeTime: 0,
     experimentsThisSession: 0,
     autoResumeTurns: 0,
     lastRunChecks: null,
     lastRunDuration: null,
     runningExperiment: null,
     state: createExperimentState(),
-    recoveryNotice: null,
-    stagnation: null,
-    iterationStartTokens: null,
-    iterationTokenHistory: [],
+    pendingResumeTimer: null,
+    pendingResumeMessage: null,
   };
 }
 
@@ -736,241 +664,6 @@ function createRuntimeStore() {
   };
 }
 
-function runGitSync(cwd: string, args: string[]): string | null {
-  try {
-    const result = spawnSync("git", args, {
-      cwd,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    if (result.status !== 0) return null;
-    return (result.stdout ?? "").trim();
-  } catch {
-    return null;
-  }
-}
-
-function inspectGitContext(cwd: string): GitContext {
-  const repoRoot = runGitSync(cwd, ["rev-parse", "--show-toplevel"]);
-  const branch = runGitSync(cwd, ["branch", "--show-current"]);
-  const gitDir = runGitSync(cwd, ["rev-parse", "--git-dir"]);
-  const commonDir = runGitSync(cwd, ["rev-parse", "--git-common-dir"]);
-  const dirtyOutput = runGitSync(cwd, ["status", "--porcelain", "--untracked-files=no"]);
-  const normalizedGitDir = gitDir ? path.resolve(cwd, gitDir) : null;
-  const normalizedCommonDir = commonDir ? path.resolve(cwd, commonDir) : null;
-  const inferredWorktree = cwd.includes(`${path.sep}.worktrees${path.sep}`) || cwd.includes("/.worktrees/");
-
-  return {
-    repoRoot,
-    branch: branch || null,
-    detached: repoRoot !== null && !branch,
-    isWorktree: inferredWorktree || (!!normalizedGitDir && !!normalizedCommonDir && normalizedGitDir !== normalizedCommonDir),
-    dirty: !!dirtyOutput,
-  };
-}
-
-function getRuntimeStatePath(workDir: string): string {
-  return path.join(workDir, "autoresearch.state.json");
-}
-
-function getResearchCheckpointPath(workDir: string): string {
-  return path.join(workDir, "autoresearch.research.md");
-}
-
-function getLessonsPath(workDir: string): string {
-  return path.join(workDir, "autoresearch.lessons.jsonl");
-}
-
-function isAnalysisOnlyResult(result: ExperimentResult): boolean {
-  const description = result.description.toLowerCase();
-  return result.metrics?.analysis_only === 1
-    || description.includes("analysis-only")
-    || description.includes("trace-analysis")
-    || description.includes("analysis cycle")
-    || description.includes("no benchmark run");
-}
-
-function isNoCodeResult(result: ExperimentResult): boolean {
-  const description = result.description.toLowerCase();
-  return isAnalysisOnlyResult(result)
-    || description.includes("no-code")
-    || description.includes("no code change")
-    || description.includes("unchanged control")
-    || description.includes("calibration")
-    || description.includes("baseline recovery noise");
-}
-
-function normalizeLessonValue(value: unknown): string | undefined {
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
-  }
-  return undefined;
-}
-
-function buildLessonEntry(run: number, state: ExperimentState, experiment: ExperimentResult): LessonEntry | null {
-  const asi = experiment.asi ?? {};
-  const hypothesis = normalizeLessonValue(asi.hypothesis);
-  const learned = normalizeLessonValue(asi.learned);
-  const rollbackReason = normalizeLessonValue(asi.rollback_reason);
-  const nextActionHint = normalizeLessonValue(asi.next_action_hint);
-  const analysisOnly = isAnalysisOnlyResult(experiment);
-
-  if (!hypothesis && !learned && !rollbackReason && !nextActionHint && experiment.status === "keep" && !analysisOnly) {
-    return null;
-  }
-
-  const tags = [experiment.status];
-  if (analysisOnly) tags.push("analysis_only");
-  if (isNoCodeResult(experiment)) tags.push("no_code");
-  if (experiment.status !== "keep") tags.push("rollback");
-
-  return {
-    run,
-    segment: experiment.segment,
-    timestamp: experiment.timestamp,
-    commit: experiment.commit,
-    status: experiment.status,
-    metricName: state.metricName,
-    metricUnit: state.metricUnit,
-    metric: experiment.metric,
-    metrics: { ...experiment.metrics },
-    description: experiment.description,
-    hypothesis,
-    learned,
-    rollbackReason,
-    nextActionHint,
-    analysisOnly,
-    tags,
-    asi: experiment.asi,
-  };
-}
-
-function appendLessonEntry(workDir: string, lesson: LessonEntry): void {
-  fs.appendFileSync(getLessonsPath(workDir), JSON.stringify(lesson) + "\n");
-}
-
-function computeStagnationSnapshot(workDir: string, runtime: AutoresearchRuntime): StagnationSnapshot | null {
-  const current = currentResults(runtime.state.results, runtime.state.currentSegment);
-  if (current.length === 0) return null;
-
-  let trailingNonKeep = 0;
-  let trailingNoCode = 0;
-  let trailingAnalysisOnly = 0;
-  let lastKeepRun: number | null = null;
-
-  for (let i = current.length - 1; i >= 0; i--) {
-    const result = current[i];
-    if (result.status === "keep") {
-      lastKeepRun = runtime.state.results.findIndex((candidate) => candidate === result) + 1;
-      break;
-    }
-    trailingNonKeep++;
-  }
-
-  for (let i = current.length - 1; i >= 0; i--) {
-    if (!isNoCodeResult(current[i])) break;
-    trailingNoCode++;
-  }
-
-  for (let i = current.length - 1; i >= 0; i--) {
-    if (!isAnalysisOnlyResult(current[i])) break;
-    trailingAnalysisOnly++;
-  }
-
-  const researchExists = fs.existsSync(getResearchCheckpointPath(workDir));
-  const stagnant = trailingAnalysisOnly >= 3 || trailingNoCode >= 5 || trailingNonKeep >= 8;
-  if (!stagnant) {
-    return {
-      recommendation: "continue",
-      trailingNonKeep,
-      trailingNoCode,
-      trailingAnalysisOnly,
-      lastKeepRun,
-      summary: `Loop still has room to search (non-keep tail ${trailingNonKeep}, no-code tail ${trailingNoCode}, analysis tail ${trailingAnalysisOnly}).`,
-    };
-  }
-
-  const recommendation = researchExists ? "blocked" : "research";
-  const summary = recommendation === "research"
-    ? `Stagnation detected: ${trailingNonKeep} non-keep runs, ${trailingNoCode} consecutive no-code cycles, ${trailingAnalysisOnly} consecutive analysis-only cycles. Run a research checkpoint before another experiment.`
-    : `Stagnation persists after a research checkpoint file already exists. Treat the loop as blocked/saturated unless a concretely better hypothesis appears.`;
-
-  return {
-    recommendation,
-    trailingNonKeep,
-    trailingNoCode,
-    trailingAnalysisOnly,
-    lastKeepRun,
-    summary,
-  };
-}
-
-function readPersistedRuntimeState(workDir: string): PersistedAutoresearchState | null {
-  try {
-    const statePath = getRuntimeStatePath(workDir);
-    if (!fs.existsSync(statePath)) return null;
-    const parsed = JSON.parse(fs.readFileSync(statePath, "utf8")) as PersistedAutoresearchState;
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function collectHealthChecks(workDir: string, runtime: AutoresearchRuntime): HealthCheck[] {
-  const checks: HealthCheck[] = [];
-  const git = inspectGitContext(workDir);
-
-  if (!git.repoRoot) {
-    checks.push({ level: "error", message: "Working directory is not inside a git repository." });
-    return checks;
-  }
-
-  if (git.detached) {
-    checks.push({ level: "error", message: "HEAD is detached — autoresearch should run on a branch so keep/discard commits stay recoverable." });
-  }
-
-  if (runtime.autoresearchMode && !git.isWorktree) {
-    checks.push({ level: "warning", message: "Autoresearch is not running in a git worktree. Unattended runs are safer in an isolated worktree." });
-  }
-
-  if (git.dirty && !runtime.runningExperiment) {
-    checks.push({ level: "warning", message: "Repository has tracked uncommitted changes. Review repo state before leaving an unattended run active." });
-  }
-
-  return checks;
-}
-
-function summarizeRuntimeState(workDir: string, sessionId: string, runtime: AutoresearchRuntime): PersistedAutoresearchState {
-  const current = currentResults(runtime.state.results, runtime.state.currentSegment);
-  runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
-  return {
-    version: 1,
-    updatedAt: Date.now(),
-    autoresearchMode: runtime.autoresearchMode,
-    status: runtime.autoresearchMode ? (runtime.runningExperiment ? "running" : "idle") : "off",
-    workDir,
-    sessionId,
-    git: inspectGitContext(workDir),
-    runningExperiment: runtime.runningExperiment,
-    recoveryNotice: runtime.recoveryNotice,
-    stagnation: runtime.stagnation,
-    summary: {
-      name: runtime.state.name,
-      metricName: runtime.state.metricName,
-      metricUnit: runtime.state.metricUnit,
-      bestDirection: runtime.state.bestDirection,
-      runs: runtime.state.results.length,
-      kept: current.filter((result) => result.status === "keep").length,
-      crashed: current.filter((result) => result.status === "crash").length,
-      checksFailed: current.filter((result) => result.status === "checks_failed").length,
-      baselineMetric: runtime.state.bestMetric,
-      confidence: runtime.state.confidence,
-      maxExperiments: runtime.state.maxExperiments,
-    },
-  };
-}
-
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -984,7 +677,7 @@ function renderDashboardLines(
   width: number,
   th: Theme,
   maxRows: number = 6,
-  headerHint?: string
+  headerHints: string[] = []
 ): string[] {
   const lines: string[] = [];
 
@@ -1168,12 +861,8 @@ function renderDashboardLines(
     `${th.fg("muted", "description")}`;
 
   lines.push(
-    headerHint
-      ? appendRightAlignedAdaptiveHint(headerLine, width, th, [
-          headerHint,
-          "ctrl+x collapse • full: c-s-x",
-          "ctrl+x • c-s-x",
-        ])
+    headerHints.length > 0
+      ? appendRightAlignedAdaptiveHint(headerLine, width, th, headerHints)
       : truncateToWidth(headerLine, width, "…", true)
   );
   lines.push(
@@ -1289,32 +978,188 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const MAX_AUTORESUME_TURNS = 20;
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
-  const AUTORESEARCH_SESSION_FILES = [
-    "autoresearch.state.json",
-    "autoresearch.jsonl",
-    "autoresearch.lessons.jsonl",
-    "autoresearch.md",
-    "autoresearch.ideas.md",
-    "autoresearch.research.md",
-    "autoresearch.sh",
-    "autoresearch.checks.sh",
-  ];
+
+  // Outlasts pi's internal retry (setTimeout 0) and compaction-continue
+  // (setTimeout 100); see badlogic/pi-mono#2023, #2110.
+  const SETTLED_WINDOW_MS = 800;
+  const shortcuts = resolveAutoresearchShortcuts();
+
+  const dashboardHintVariants = (toggleAction: "expand" | "collapse"): string[] => {
+    const toggle = shortcuts.toggleDashboard
+      ? `${shortcuts.toggleDashboard} ${toggleAction}`
+      : null;
+    const fullscreen = shortcuts.fullscreenDashboard
+      ? `${shortcuts.fullscreenDashboard} fullscreen`
+      : null;
+
+    if (toggle && fullscreen) {
+      return [
+        `${toggle} • ${fullscreen}`,
+        `${toggle} • full: ${shortcuts.fullscreenDashboard}`,
+        `${shortcuts.toggleDashboard} • ${shortcuts.fullscreenDashboard}`,
+      ];
+    }
+
+    return [toggle, fullscreen].filter((hint): hint is string => hint !== null);
+  };
 
   const runtimeStore = createRuntimeStore();
   const getSessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionId();
   const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime =>
     runtimeStore.ensure(getSessionKey(ctx));
-  const persistRuntimeState = (ctx: ExtensionContext) => {
-    try {
-      const workDir = resolveWorkDir(ctx.cwd);
-      const payload = summarizeRuntimeState(workDir, getSessionKey(ctx), getRuntime(ctx));
-      fs.writeFileSync(getRuntimeStatePath(workDir), JSON.stringify(payload, null, 2) + "\n");
-    } catch {
-      // Best effort only — jsonl remains the source of truth for experiment history.
-    }
+
+  const isAgentSettled = (ctx: ExtensionContext): boolean =>
+    ctx.isIdle() && !ctx.hasPendingMessages();
+
+  const hasPendingResume = (runtime: AutoresearchRuntime): boolean =>
+    runtime.pendingResumeMessage !== null;
+
+  const pausePendingResume = (runtime: AutoresearchRuntime): void => {
+    if (!runtime.pendingResumeTimer) return;
+    clearTimeout(runtime.pendingResumeTimer);
+    runtime.pendingResumeTimer = null;
   };
-  const formatHealthChecks = (checks: HealthCheck[]): string[] =>
-    checks.map((check) => `${check.level === "error" ? "❌" : "⚠️"} ${check.message}`);
+
+  const cancelPendingResume = (runtime: AutoresearchRuntime): void => {
+    pausePendingResume(runtime);
+    runtime.pendingResumeMessage = null;
+  };
+
+  const markAutoResumeSent = (runtime: AutoresearchRuntime): void => {
+    runtime.autoResumeTurns++;
+  };
+
+  const sendPendingResumeIfReady = (ctx: ExtensionContext, runtime: AutoresearchRuntime): void => {
+    const message = runtime.pendingResumeMessage;
+
+    if (!message) return;
+    if (!runtime.autoresearchMode) {
+      cancelPendingResume(runtime);
+      return;
+    }
+    if (!isAgentSettled(ctx)) return;
+    if (hasReachedAutoResumeLimit(runtime)) {
+      cancelPendingResume(runtime);
+      notifyAutoResumeLimitReached(ctx);
+      return;
+    }
+
+    cancelPendingResume(runtime);
+    markAutoResumeSent(runtime);
+    pi.sendUserMessage(message);
+  };
+
+  const schedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime, message: string): void => {
+    pausePendingResume(runtime);
+    runtime.pendingResumeMessage = message;
+    runtime.pendingResumeTimer = setTimeout(
+      () => sendPendingResumeIfReady(ctx, runtime),
+      SETTLED_WINDOW_MS,
+    );
+  };
+
+  const reschedulePendingResume = (ctx: ExtensionContext, runtime: AutoresearchRuntime): void => {
+    if (!hasPendingResume(runtime)) return;
+    schedulePendingResume(ctx, runtime, runtime.pendingResumeMessage!);
+  };
+
+  const hasRunExperimentsThisSession = (runtime: AutoresearchRuntime): boolean =>
+    runtime.experimentsThisSession > 0;
+
+  // Why the experiment gate: a chat-only turn would otherwise loop forever,
+  // because every agent_end would re-prompt the agent, which would chat again.
+  const shouldAutoResumeAfterTurn = (runtime: AutoresearchRuntime): boolean =>
+    runtime.autoresearchMode && hasRunExperimentsThisSession(runtime);
+
+  const shouldAutoResumeAfterCompact = (runtime: AutoresearchRuntime): boolean =>
+    runtime.autoresearchMode;
+
+  const hasReachedAutoResumeLimit = (runtime: AutoresearchRuntime): boolean =>
+    runtime.autoResumeTurns >= MAX_AUTORESUME_TURNS;
+
+  const notifyAutoResumeLimitReached = (ctx: ExtensionContext): void => {
+    ctx.ui.notify(
+      `Autoresearch auto-resume limit reached (${MAX_AUTORESUME_TURNS} turns)`,
+      "info",
+    );
+  };
+
+  const composeResumeMessage = (_ctx: ExtensionContext): string => {
+    return [
+      "Run the next iteration now.",
+      "Use the persisted autoresearch state as needed, pick the most promising hypothesis, then call run_experiment + log_experiment.",
+      BENCHMARK_GUARDRAIL,
+    ].join(" ");
+  };
+
+  const composeCompactionResumeMessage = (_ctx: ExtensionContext): string => {
+    // The compaction summary already contains the rules, ideas, and recent
+    // runs — so this resume message just kicks the loop forward.
+    return [
+      "Run the next iteration now.",
+      "Pick the most promising hypothesis from the ideas backlog or the latest `next:` hints in recent runs, then call run_experiment + log_experiment.",
+      "Do not re-read autoresearch.md or autoresearch.jsonl — the compaction summary already contains them.",
+      BENCHMARK_GUARDRAIL,
+    ].join(" ");
+  };
+
+  const autoresearchCompactionFor = (
+    ctx: ExtensionContext,
+    event: SessionBeforeCompactEvent,
+  ) => {
+    if (!getRuntime(ctx).autoresearchMode) return undefined;
+    return {
+      compaction: {
+        summary: buildAutoresearchCompactionSummary(
+          autoresearchSummaryPathsFor(resolveWorkDir(ctx.cwd)),
+        ),
+        firstKeptEntryId: event.preparation.firstKeptEntryId,
+        tokensBefore: event.preparation.tokensBefore,
+      },
+    };
+  };
+
+  const sendWhenReady = (ctx: ExtensionContext, message: string): void => {
+    if (ctx.isIdle()) {
+      pi.sendUserMessage(message);
+      return;
+    }
+    pi.sendUserMessage(message, { deliverAs: "followUp" });
+  };
+
+  const hasAutoresearchRules = (ctx: ExtensionContext): boolean =>
+    fs.existsSync(autoresearchMdPath(resolveWorkDir(ctx.cwd)));
+
+  const readJsonlLines = (workDir: string): string[] => {
+    const jsonlPath = autoresearchJsonlPath(workDir);
+    if (!fs.existsSync(jsonlPath)) return [];
+    return fs.readFileSync(jsonlPath, "utf-8").split("\n").filter(Boolean);
+  };
+
+  const readLastRun = (workDir: string): Record<string, unknown> | null => {
+    const lines = readJsonlLines(workDir);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const entry = parseJsonlEntry(lines[i]);
+      if (isAutoresearchRunEntry(entry)) return entry;
+    }
+    return null;
+  };
+
+  const buildSessionSnapshot = (state: ExperimentState): SessionSnapshot => ({
+    metric_name: state.metricName,
+    metric_unit: state.metricUnit,
+    direction: state.bestDirection,
+    baseline_metric: state.bestMetric,
+    best_metric: findBestMetric(state.results, state.currentSegment, state.bestDirection),
+    run_count: state.results.length,
+    goal: state.name ?? "",
+  });
+
+  const fireHook = async (payload: HookPayload): Promise<string | null> => {
+    const result = await runHook(payload);
+    appendHookLogEntryIfConfigured(autoresearchJsonlPath(payload.cwd), payload.event, result);
+    return steerMessageFor(payload.event, result);
+  };
 
   // Running experiment state (for spinner in fullscreen overlay)
   let overlayTui: { requestRender: () => void } | null = null;
@@ -1343,15 +1188,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const autoresearchHelp = () =>
     [
-      "Usage: /autoresearch [status|research [text]|resume [text]|off|clear|export|<text>]",
+      "Usage: /autoresearch [off|clear|export|<text>]",
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
-      "status shows mode, git/worktree health, stagnation state, and current progress.",
-      "research starts a research-checkpoint turn before another experiment.",
-      "resume re-enters autoresearch mode using existing session files.",
-      "clear deletes autoresearch.jsonl and autoresearch.state.json, then turns autoresearch mode off.",
+      "clear deletes autoresearch.jsonl and turns autoresearch mode off.",
       "export opens a local live dashboard for autoresearch.jsonl in your browser.",
+
       "",
       "Examples:",
       "  /autoresearch optimize unit test runtime, monitor correctness",
@@ -1365,89 +1208,36 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const reconstructState = (ctx: ExtensionContext) => {
     const runtime = getRuntime(ctx);
+    cancelPendingResume(runtime);
     runtime.lastRunChecks = null;
     runtime.lastRunDuration = null;
     runtime.runningExperiment = null;
-    runtime.lastAutoResumeTime = 0;
     runtime.experimentsThisSession = 0;
     runtime.autoResumeTurns = 0;
-    runtime.iterationStartTokens = null;
-    runtime.iterationTokenHistory = [];
     runtime.state = createExperimentState();
-    runtime.recoveryNotice = null;
 
     let state = runtime.state;
 
     // Resolve effective working directory (config stays in ctx.cwd, files in workDir)
     const workDir = resolveWorkDir(ctx.cwd);
-    const persistedState = readPersistedRuntimeState(workDir);
 
     // Primary: read from autoresearch.jsonl (alongside autoresearch.md/sh)
-    const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+    const jsonlPath = autoresearchJsonlPath(workDir);
     let loadedFromJsonl = false;
     try {
       if (fs.existsSync(jsonlPath)) {
-        let segment = 0;
-        const lines = fs.readFileSync(jsonlPath, "utf-8").trim().split("\n").filter(Boolean);
-        for (const line of lines) {
-          try {
-            const entry = JSON.parse(line);
+        const reconstructed = reconstructJsonlState(fs.readFileSync(jsonlPath, "utf-8"));
+        state.name = reconstructed.name;
+        state.metricName = reconstructed.metricName;
+        state.metricUnit = reconstructed.metricUnit;
+        state.bestDirection = reconstructed.bestDirection;
+        state.currentSegment = reconstructed.currentSegment;
+        state.results = reconstructed.results.map((result) => ({
+          ...result,
+          metrics: { ...result.metrics },
+        }));
+        state.secondaryMetrics = reconstructed.secondaryMetrics.map((metric) => ({ ...metric }));
 
-            // Config header line — each header starts a new segment
-            if (entry.type === "config") {
-              if (entry.name) state.name = entry.name;
-              if (entry.metricName) state.metricName = entry.metricName;
-              if (entry.metricUnit !== undefined) state.metricUnit = entry.metricUnit;
-              if (entry.bestDirection) state.bestDirection = entry.bestDirection;
-              // Increment segment (first config = 0, second = 1, etc.)
-              if (state.results.length > 0) {
-                segment++;
-                // Reset per-segment tracking (mirrors live reinit behavior)
-                state.secondaryMetrics = [];
-              }
-              state.currentSegment = segment;
-              continue;
-            }
-
-            // Experiment-like result line
-            if (typeof entry.status !== "string" || typeof entry.description !== "string") {
-              continue;
-            }
-
-            const iterationTokens = entry.iterationTokens ?? null;
-            state.results.push({
-              commit: entry.commit ?? "",
-              metric: entry.metric ?? 0,
-              metrics: entry.metrics ?? {},
-              status: entry.status,
-              description: entry.description,
-              timestamp: entry.timestamp ?? 0,
-              segment,
-              confidence: entry.confidence ?? null,
-              iterationTokens,
-              asi: entry.asi ?? undefined,
-            });
-
-            if (typeof iterationTokens === "number" && iterationTokens > 0) {
-              runtime.iterationTokenHistory.push(iterationTokens);
-            }
-
-            // Register secondary metrics
-            for (const name of Object.keys(entry.metrics ?? {})) {
-              if (!state.secondaryMetrics.find((m) => m.name === name)) {
-                let unit = "";
-                if (name.endsWith("µs")) unit = "µs";
-                else if (name.endsWith("_ms")) unit = "ms";
-                else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
-                else if (name.endsWith("_kb")) unit = "kb";
-                else if (name.endsWith("_mb")) unit = "mb";
-                state.secondaryMetrics.push({ name, unit });
-              }
-            }
-          } catch {
-            // Skip malformed lines
-          }
-        }
         if (state.results.length > 0) {
           loadedFromJsonl = true;
           state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
@@ -1489,19 +1279,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     state.maxExperiments = readMaxExperiments(ctx.cwd);
 
     // Auto-enter autoresearch mode only when a persisted experiment log exists
-    runtime.autoresearchMode = fs.existsSync(path.join(workDir, "autoresearch.jsonl"));
-
-    if (persistedState?.status === "running" && persistedState.runningExperiment) {
-      runtime.recoveryNotice = `Recovered after an interrupted experiment: ${persistedState.runningExperiment.command}`;
-      if (ctx.hasUI) {
-        ctx.ui.notify(runtime.recoveryNotice, "warning");
-      }
-    }
-
-    runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
+    runtime.autoresearchMode = fs.existsSync(autoresearchJsonlPath(workDir));
 
     updateWidget(ctx);
-    persistRuntimeState(ctx);
   };
 
   const updateWidget = (ctx: ExtensionContext) => {
@@ -1563,7 +1343,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               safeWidth,
               theme,
               rows,
-              "ctrl+x collapse • ctrl+shift+x fullscreen"
+              dashboardHintVariants("collapse")
             ),
           ];
         },
@@ -1654,12 +1434,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           if (state.name) optional.push(theme.fg("dim", ` │ ${state.name}`));
 
           const left = [...essential, ...optional].join("");
+          const hintVariants = dashboardHintVariants("expand");
           return [
-            appendRightAlignedAdaptiveHint(left, safeWidth, theme, [
-              "ctrl+x expand • ctrl+shift+x fullscreen",
-              "ctrl+x expand • full: c-s-x",
-              "ctrl+x • c-s-x",
-            ]),
+            hintVariants.length > 0
+              ? appendRightAlignedAdaptiveHint(left, safeWidth, theme, hintVariants)
+              : truncateToWidth(left, safeWidth, "…", true),
           ];
         },
         invalidate(): void {},
@@ -1677,73 +1456,52 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     clearOverlay();
   });
   pi.on("session_shutdown", async (_e, ctx) => {
-    persistRuntimeState(ctx);
     clearSessionUi(ctx);
+    cancelPendingResume(getRuntime(ctx));
     runtimeStore.clear(getSessionKey(ctx));
     stopDashboardServer();
   });
-  }
 
-  if (!isHeadlessJson) {
-  // Reset per-session experiment counter when agent starts
   pi.on("agent_start", async (_event, ctx) => {
-    getRuntime(ctx).experimentsThisSession = 0;
-    persistRuntimeState(ctx);
+    const runtime = getRuntime(ctx);
+    runtime.experimentsThisSession = 0;
+    pausePendingResume(runtime);
   });
 
-  // Clear running experiment state when agent stops; check ideas file for continuation
+  const ensurePendingResume = (
+    ctx: ExtensionContext,
+    gate: (runtime: AutoresearchRuntime) => boolean,
+    composeMessage: (ctx: ExtensionContext) => string = composeResumeMessage,
+  ): void => {
+    const runtime = getRuntime(ctx);
+    if (hasPendingResume(runtime)) {
+      reschedulePendingResume(ctx, runtime);
+      return;
+    }
+    if (!gate(runtime)) return;
+    if (hasReachedAutoResumeLimit(runtime)) {
+      notifyAutoResumeLimitReached(ctx);
+      return;
+    }
+    schedulePendingResume(ctx, runtime, composeMessage(ctx));
+  };
+
+  pi.on("session_before_compact", async (event, ctx) => {
+    pausePendingResume(getRuntime(ctx));
+    return autoresearchCompactionFor(ctx, event);
+  });
+
+  pi.on("session_compact", async (_event, ctx) => {
+    ensurePendingResume(ctx, shouldAutoResumeAfterCompact, composeCompactionResumeMessage);
+  });
+
   pi.on("agent_end", async (_event, ctx) => {
     const runtime = getRuntime(ctx);
     runtime.runningExperiment = null;
     if (overlayTui) overlayTui.requestRender();
-
-    if (!runtime.autoresearchMode) return;
-
-    // Don't auto-resume if no experiments ran this session (user likely stopped manually)
-    if (runtime.experimentsThisSession === 0) return;
-
-    // Rate-limit auto-resume to once every 5 minutes
-    const now = Date.now();
-    if (now - runtime.lastAutoResumeTime < 5 * 60 * 1000) return;
-    runtime.lastAutoResumeTime = now;
-
-    if (runtime.autoResumeTurns >= MAX_AUTORESUME_TURNS) {
-      ctx.ui.notify(
-        `Autoresearch auto-resume limit reached (${MAX_AUTORESUME_TURNS} turns)`,
-        "info"
-      );
-      return;
-    }
-
-    // Auto-continue: send a message to resume the loop
-    // The agent reads autoresearch.md on startup which has all context
-    const workDir = resolveWorkDir(ctx.cwd);
-    const ideasPath = path.join(workDir, "autoresearch.ideas.md");
-    const researchPath = getResearchCheckpointPath(workDir);
-    const hasIdeas = fs.existsSync(ideasPath);
-    const hasResearch = fs.existsSync(researchPath);
-    runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
-
-    let resumeMsg = "Autoresearch loop ended (likely context limit). Resume the experiment loop — read autoresearch.md and git log for context.";
-    if (hasIdeas) {
-      resumeMsg += " Check autoresearch.ideas.md for promising paths to explore. Prune stale/tried ideas.";
-    }
-    if (runtime.stagnation?.recommendation === "research") {
-      resumeMsg += ` The loop is stagnating. Before another experiment, create or update ${researchPath} with a research checkpoint and only run a new experiment if that produces a materially new idea.`;
-    } else if (runtime.stagnation?.recommendation === "blocked") {
-      resumeMsg += hasResearch
-        ? ` A research checkpoint already exists at ${researchPath} and the loop still looks stagnant. Do not run another blind calibration; either promote one explicitly research-backed experiment or stop as blocked/saturated.`
-        : " The loop still looks blocked/saturated. Do not run another blind calibration without a materially new hypothesis.";
-    }
-    resumeMsg += ` ${BENCHMARK_GUARDRAIL}`;
-
-    runtime.autoResumeTurns++;
-    persistRuntimeState(ctx);
-    pi.sendUserMessage(resumeMsg);
+    ensurePendingResume(ctx, shouldAutoResumeAfterTurn);
   });
-  }
 
-  if (!isHeadlessJson) {
   // When in autoresearch mode, add a static note to the system prompt.
   // Only a short pointer — no file content, fully cache-safe.
   pi.on("before_agent_start", async (event, ctx) => {
@@ -1751,16 +1509,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (!runtime.autoresearchMode) return;
 
     const workDir = resolveWorkDir(ctx.cwd);
-    const mdPath = path.join(workDir, "autoresearch.md");
-    const ideasPath = path.join(workDir, "autoresearch.ideas.md");
-    const researchPath = getResearchCheckpointPath(workDir);
-    const lessonsPath = getLessonsPath(workDir);
+    const mdPath = autoresearchMdPath(workDir);
+    const ideasPath = autoresearchIdeasPath(workDir);
     const hasIdeas = fs.existsSync(ideasPath);
-    const hasResearch = fs.existsSync(researchPath);
-    const hasLessons = fs.existsSync(lessonsPath);
-    runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
 
-    const checksPath = path.join(workDir, "autoresearch.checks.sh");
+    const checksPath = autoresearchChecksPath(workDir);
     const hasChecks = fs.existsSync(checksPath);
 
     let extra =
@@ -1784,31 +1537,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
     if (hasIdeas) {
       extra += `\n\n💡 Ideas backlog exists at ${ideasPath} — check it for promising experiment paths. Prune stale entries.`;
-    }
-
-    if (hasLessons) {
-      extra += `\n🧠 Lessons memory exists at ${lessonsPath} — mine it for dead ends, durable learnings, and next-action hints before repeating old work.`;
-    }
-
-    if (hasResearch) {
-      extra += `\n📚 Research checkpoint file exists at ${researchPath} — read it before choosing the next experiment.`;
-    }
-
-    if (runtime.stagnation && runtime.stagnation.recommendation !== "continue") {
-      extra +=
-        "\n\n## Stagnation Checkpoint" +
-        `\n${runtime.stagnation.summary}`;
-
-      if (runtime.stagnation.recommendation === "research") {
-        extra +=
-          `\nBefore another experiment, create or update ${researchPath}.` +
-          "\nDo a research checkpoint first: summarize the repeated local dead ends, use any available docs/web/code research tools to gather 3-5 fresh external findings, write the findings to autoresearch.research.md, and distill only the best 1-3 new hypotheses into autoresearch.ideas.md." +
-          "\nOnly run a new experiment in this session if that research produces a materially new, evidence-backed idea.";
-      } else {
-        extra +=
-          `\nA research checkpoint file already exists at ${researchPath} and the loop still looks stagnant.` +
-          "\nDo not do another blind calibration run. Either promote one explicitly research-backed experiment or state that the benchmark is blocked/saturated and stop the loop.";
-      }
     }
 
     return {
@@ -1871,7 +1599,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Write config header to jsonl (append for re-init, create for first)
       const workDir = resolveWorkDir(ctx.cwd);
       try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+        const jsonlPath = autoresearchJsonlPath(workDir);
         const config = JSON.stringify({
           type: "config",
           name: state.name,
@@ -1895,10 +1623,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
+      const wasInactive = !runtime.autoresearchMode;
       runtime.autoresearchMode = true;
-      runtime.iterationStartTokens = ctx.getContextUsage()?.tokens ?? null;
       updateWidget(ctx);
-      persistRuntimeState(ctx);
+
+      if (wasInactive) {
+        const steer = await fireHook({
+          event: "before",
+          cwd: workDir,
+          next_run: state.results.length + 1,
+          last_run: readLastRun(workDir),
+          session: buildSessionSnapshot(state),
+        });
+        if (steer) pi.sendUserMessage(steer, { deliverAs: "steer" });
+      }
 
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
       const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)` : "";
@@ -1956,14 +1694,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
       const workDir = resolveWorkDir(ctx.cwd);
-      const healthChecks = collectHealthChecks(workDir, runtime);
-      const blockingHealthChecks = healthChecks.filter((check) => check.level === "error");
-      if (blockingHealthChecks.length > 0) {
-        return {
-          content: [{ type: "text", text: `❌ Autoresearch health check failed:\n${formatHealthChecks(blockingHealthChecks).join("\n")}` }],
-          details: {},
-        };
-      }
 
       // Block if max experiments limit already reached
       if (state.maxExperiments !== null) {
@@ -1979,7 +1709,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const timeout = (params.timeout_seconds ?? 600) * 1000;
 
       // Guard: if autoresearch.sh exists, only allow running it
-      const autoresearchShPath = path.join(workDir, "autoresearch.sh");
+      const autoresearchShPath = autoresearchScriptPath(workDir);
       if (fs.existsSync(autoresearchShPath) && !isAutoresearchShCommand(params.command)) {
         return {
           content: [{
@@ -2002,19 +1732,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
 
-      advanceIterationTracking(runtime, ctx);
-      if (isContextExhausted(runtime, ctx)) {
-        runtime.autoresearchMode = false;
-        ctx.abort();
-        return {
-          content: [{ type: "text", text: "🛑 Context window almost full. Start a new pi session to continue — all progress is saved." }],
-          details: {},
-        };
-      }
-
-      runtime.recoveryNotice = null;
+      // TODO(/tree): replace compaction-based resume with a checkpoint-per-iteration model.
       runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
-      persistRuntimeState(ctx);
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
 
@@ -2180,7 +1899,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         });
       }).finally(() => {
         runtime.runningExperiment = null;
-        persistRuntimeState(ctx);
         updateWidget(ctx);
         if (overlayTui) overlayTui.requestRender();
       });
@@ -2195,7 +1913,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let checksOutput = "";
       let checksDuration = 0;
 
-      const checksPath = path.join(workDir, "autoresearch.checks.sh");
+      const checksPath = autoresearchChecksPath(workDir);
       if (benchmarkPassed && fs.existsSync(checksPath)) {
         const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
         const ct0 = Date.now();
@@ -2291,11 +2009,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `📊 Current best ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}\n`;
       }
 
-      const nonBlockingHealthChecks = healthChecks.filter((check) => check.level === "warning");
-      if (nonBlockingHealthChecks.length > 0) {
-        text += `⚠️ Health checks:\n${formatHealthChecks(nonBlockingHealthChecks).join("\n")}\n`;
-      }
-
       // Show parsed METRIC lines to the LLM
       if (parsedMetrics) {
         const secondary = Object.entries(parsedMetrics).filter(([k]) => k !== state.metricName);
@@ -2334,7 +2047,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += `\n\n── Checks output (last 80 lines) ──\n${details.checksOutput}`;
       }
 
-      persistRuntimeState(ctx);
       return {
         content: [{ type: "text", text }],
         details: { ...details, truncation: llmTruncation.truncated ? llmTruncation : undefined, fullOutputPath },
@@ -2499,14 +2211,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         };
       }
       const workDir = resolveWorkDir(ctx.cwd);
-      const healthChecks = collectHealthChecks(workDir, runtime);
-      const blockingHealthChecks = healthChecks.filter((check) => check.level === "error");
-      if (blockingHealthChecks.length > 0) {
-        return {
-          content: [{ type: "text", text: `❌ Autoresearch health check failed:\n${formatHealthChecks(blockingHealthChecks).join("\n")}` }],
-          details: {},
-        };
-      }
       const secondaryMetrics = params.metrics ?? {};
 
       // Gate: prevent "keep" when last run's checks failed
@@ -2555,8 +2259,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         ? params.asi as ASI
         : undefined;
 
-      const iterationTokens = lastIterationTokens(runtime);
-
       const experiment: ExperimentResult = {
         commit: params.commit.slice(0, 7),
         metric: params.metric,
@@ -2566,7 +2268,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         timestamp: Date.now(),
         segment: state.currentSegment,
         confidence: null,
-        iterationTokens,
         asi: mergedASI,
       };
 
@@ -2703,70 +2404,63 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
-      // Persist to autoresearch.jsonl (always, regardless of status)
+      const jsonlEntry: Record<string, unknown> = {
+        run: state.results.length,
+        ...experiment,
+      };
+      if (!mergedASI) delete jsonlEntry.asi;
+      const jsonlLine = JSON.stringify(jsonlEntry);
+
       try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
-        const jsonlEntry: Record<string, unknown> = {
-          run: state.results.length,
-          ...experiment,
-        };
-        // Only write asi if present (keep lines compact when no ASI)
-        if (!mergedASI) delete jsonlEntry.asi;
-        fs.appendFileSync(jsonlPath, JSON.stringify(jsonlEntry) + "\n");
+        fs.appendFileSync(autoresearchJsonlPath(workDir), jsonlLine + "\n");
         broadcastDashboardUpdate(workDir);
       } catch (e) {
         text += `\n⚠️ Failed to write autoresearch.jsonl: ${e instanceof Error ? e.message : String(e)}`;
       }
 
-      try {
-        const lesson = buildLessonEntry(state.results.length, state, experiment);
-        if (lesson) {
-          appendLessonEntry(workDir, lesson);
-          text += `\n🧠 Lesson captured in autoresearch.lessons.jsonl`;
-        }
-      } catch (e) {
-        text += `\n⚠️ Failed to write autoresearch.lessons.jsonl: ${e instanceof Error ? e.message : String(e)}`;
-      }
-
-      // Auto-revert on discard/crash/checks_failed — revert all files except autoresearch session files
       if (params.status !== "keep") {
         try {
-          const protectedFiles = AUTORESEARCH_SESSION_FILES;
-          const stageCmd = protectedFiles.map((f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`).join("; ");
-          const unstageCmd = protectedFiles.map((f) => `git reset -q HEAD -- "${path.join(workDir, f)}" 2>/dev/null || true`).join("; ");
-          await pi.exec(
-            "bash",
-            ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null; ${unstageCmd}`],
-            { cwd: workDir, timeout: 10000 }
-          );
-          text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved and unstaged`;
+          const revertScript = `
+            git checkout -- . ':(exclude,glob)**/autoresearch.*' ':(exclude,glob)**/autoresearch.*/**'
+            git clean -fd -e 'autoresearch.*' -e '**/autoresearch.*/**' 2>/dev/null
+          `;
+          await pi.exec("bash", ["-c", revertScript], { cwd: workDir, timeout: 10000 });
+          text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
         } catch (e) {
           text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
         }
       }
 
-      // Clear running experiment and checks state (log_experiment consumes the run)
+      const afterSteer = await fireHook({
+        event: "after",
+        cwd: workDir,
+        run_entry: jsonlEntry,
+        session: buildSessionSnapshot(state),
+      });
+      if (afterSteer) pi.sendUserMessage(afterSteer, { deliverAs: "steer" });
+
       const wallClockSeconds = runtime.lastRunDuration;
       runtime.runningExperiment = null;
       runtime.lastRunChecks = null;
       runtime.lastRunDuration = null;
 
-
-      // Check if max experiments limit reached
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
       if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
         runtime.autoresearchMode = false;
         ctx.abort();
-      }
-
-      const nonBlockingHealthChecks = healthChecks.filter((check) => check.level === "warning");
-      if (nonBlockingHealthChecks.length > 0) {
-        text += `\n⚠️ Health checks:\n${formatHealthChecks(nonBlockingHealthChecks).join("\n")}`;
+      } else if (runtime.autoresearchMode) {
+        const beforeSteer = await fireHook({
+          event: "before",
+          cwd: workDir,
+          next_run: state.results.length + 1,
+          last_run: jsonlEntry,
+          session: buildSessionSnapshot(state),
+        });
+        if (beforeSteer) pi.sendUserMessage(beforeSteer, { deliverAs: "steer" });
       }
 
       updateWidget(ctx);
-      persistRuntimeState(ctx);
 
       // Refresh fullscreen overlay if open
       if (overlayTui) overlayTui.requestRender();
@@ -2858,43 +2552,46 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   });
 
   // -----------------------------------------------------------------------
-  // Ctrl+X — toggle dashboard expand/collapse
+  // Toggle dashboard expand/collapse shortcut
   // -----------------------------------------------------------------------
 
-  pi.registerShortcut("ctrl+x", {
-    description: "Toggle autoresearch dashboard",
-    handler: async (ctx) => {
-      const runtime = getRuntime(ctx);
-      const state = runtime.state;
-      if (state.results.length === 0) {
-        if (!runtime.autoresearchMode && !fs.existsSync(path.join(resolveWorkDir(ctx.cwd), "autoresearch.md"))) {
-          ctx.ui.notify("No experiments yet — run /autoresearch to get started", "info");
-        } else {
-          ctx.ui.notify("No experiments yet", "info");
+  if (shortcuts.toggleDashboard) {
+    pi.registerShortcut(shortcuts.toggleDashboard, {
+      description: "Toggle autoresearch dashboard",
+      handler: async (ctx) => {
+        const runtime = getRuntime(ctx);
+        const state = runtime.state;
+        if (state.results.length === 0) {
+          if (!runtime.autoresearchMode && !fs.existsSync(autoresearchMdPath(resolveWorkDir(ctx.cwd)))) {
+            ctx.ui.notify("No experiments yet — run /autoresearch to get started", "info");
+          } else {
+            ctx.ui.notify("No experiments yet", "info");
+          }
+          return;
         }
-        return;
-      }
-      runtime.dashboardExpanded = !runtime.dashboardExpanded;
-      updateWidget(ctx);
-    },
-  });
+        runtime.dashboardExpanded = !runtime.dashboardExpanded;
+        updateWidget(ctx);
+      },
+    });
+  }
 
   // -----------------------------------------------------------------------
-  // Ctrl+Shift+X — fullscreen scrollable dashboard overlay
+  // Fullscreen scrollable dashboard overlay shortcut
   // -----------------------------------------------------------------------
 
-  pi.registerShortcut("ctrl+shift+x", {
-    description: "Fullscreen autoresearch dashboard",
-    handler: async (ctx) => {
-      const runtime = getRuntime(ctx);
-      const state = runtime.state;
-      if (state.results.length === 0) {
-        ctx.ui.notify("No experiments yet", "info");
-        return;
-      }
+  if (shortcuts.fullscreenDashboard) {
+    pi.registerShortcut(shortcuts.fullscreenDashboard, {
+      description: "Fullscreen autoresearch dashboard",
+      handler: async (ctx) => {
+        const runtime = getRuntime(ctx);
+        const state = runtime.state;
+        if (state.results.length === 0) {
+          ctx.ui.notify("No experiments yet", "info");
+          return;
+        }
 
-      await ctx.ui.custom<void>(
-        (tui, theme, _kb, done) => {
+        await ctx.ui.custom<void>(
+          (tui, theme, _kb, done) => {
           let scrollOffset = 0;
           let lastViewportRows = 8;
           let lastTotalRows = 0;
@@ -3009,18 +2706,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               clearOverlay();
             },
           };
-        },
-        {
-          overlay: true,
-          overlayOptions: {
-            width: "95%",
-            maxHeight: "90%",
-            anchor: "center" as const,
           },
-        }
-      );
-    },
-  });
+          {
+            overlay: true,
+            overlayOptions: {
+              width: "95%",
+              maxHeight: "90%",
+              anchor: "center" as const,
+            },
+          }
+        );
+      },
+    });
+  }
 
   // -----------------------------------------------------------------------
   // Export: local live dashboard
@@ -3057,18 +2755,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }
 
   function readJsonlContent(workDir: string): string {
-    return fs.readFileSync(path.join(workDir, "autoresearch.jsonl"), "utf-8").trim();
-  }
-
-  function extractSessionName(jsonlContent: string): string {
-    const firstLine = jsonlContent.split("\n").find((l) => l.trim());
-    if (!firstLine) return "Autoresearch";
-    try {
-      const config = JSON.parse(firstLine);
-      return config.name || "Autoresearch";
-    } catch {
-      return "Autoresearch";
-    }
+    return fs.readFileSync(autoresearchJsonlPath(workDir), "utf-8").trim();
   }
 
   function escapeHtml(text: string): string {
@@ -3123,7 +2810,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   function writeDashboardFile(workDir: string): string {
     const jsonlContent = readJsonlContent(workDir);
-    const sessionName = extractSessionName(jsonlContent);
+    const sessionName = extractAutoresearchSessionName(jsonlContent);
     const html = injectDataIntoTemplate(readTemplate(), sessionName)
       .replace(LOGO_PLACEHOLDER, logoDataUrl());
     const exportDir = fs.mkdtempSync(path.join(tmpdir(), "pi-autoresearch-dashboard-"));
@@ -3149,7 +2836,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   function resolveServedFile(workDir: string, requestPath: string): string | null {
     if (requestPath === "/") return dashboardServerHtmlPath;
-    if (requestPath === "/autoresearch.jsonl") return path.join(workDir, "autoresearch.jsonl");
+    if (requestPath === "/autoresearch.jsonl") return autoresearchJsonlPath(workDir);
     return null;
   }
 
@@ -3234,7 +2921,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   async function exportDashboard(ctx: ExtensionContext): Promise<void> {
     const workDir = resolveWorkDir(ctx.cwd);
-    const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+    const jsonlPath = autoresearchJsonlPath(workDir);
 
     if (!fs.existsSync(jsonlPath)) {
       ctx.ui.notify("No autoresearch.jsonl found \u2014 run some experiments first", "error");
@@ -3260,122 +2947,71 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // -----------------------------------------------------------------------
 
   pi.registerCommand("autoresearch", {
-    description: "Start, stop, clear, status-check, or research-checkpoint autoresearch mode",
+    description: "Start, stop, clear, or resume autoresearch mode",
     handler: async (args, ctx) => {
       const runtime = getRuntime(ctx);
       const trimmedArgs = (args ?? "").trim();
-      const lowerArgs = trimmedArgs.toLowerCase();
-      const workDir = resolveWorkDir(ctx.cwd);
+      const command = trimmedArgs.toLowerCase();
 
       if (!trimmedArgs) {
         ctx.ui.notify(autoresearchHelp(), "info");
         return;
       }
 
-      if (lowerArgs === "status") {
-        const persisted = readPersistedRuntimeState(workDir);
-        const healthChecks = collectHealthChecks(workDir, runtime);
-        const git = inspectGitContext(workDir);
-        const lines = [
-          `Mode: ${runtime.autoresearchMode ? "ON" : "OFF"}`,
-          `Work dir: ${workDir}`,
-          `Git branch: ${git.branch ?? "(detached or unknown)"}`,
-          `Git worktree: ${git.isWorktree ? "yes" : "no"}`,
-          `Runs logged: ${runtime.state.results.length}`,
-          `Current metric: ${runtime.state.metricName}`,
-          `Current best: ${formatNum(runtime.state.bestMetric, runtime.state.metricUnit)}`,
-        ];
-        if (runtime.state.maxExperiments !== null) {
-          lines.push(`Max iterations: ${runtime.state.maxExperiments}`);
-        }
-        if (runtime.runningExperiment) {
-          lines.push(`Running: ${runtime.runningExperiment.command}`);
-        }
-        if (runtime.recoveryNotice) {
-          lines.push(`Recovery: ${runtime.recoveryNotice}`);
-        }
-        runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
-        if (runtime.stagnation && runtime.stagnation.recommendation !== "continue") {
-          lines.push(`Stagnation: ${runtime.stagnation.recommendation}`);
-          lines.push(`Stagnation summary: ${runtime.stagnation.summary}`);
-          lines.push(`Research file: ${fs.existsSync(getResearchCheckpointPath(workDir)) ? "present" : "missing"}`);
-        }
-        if (persisted && !runtime.runningExperiment) {
-          lines.push(`Persisted state: ${persisted.status} (updated ${new Date(persisted.updatedAt).toLocaleString()})`);
-        }
-        if (healthChecks.length > 0) {
-          lines.push("", ...formatHealthChecks(healthChecks));
-        }
-        ctx.ui.notify(lines.join("\n"), healthChecks.some((check) => check.level === "error") ? "warning" : "info");
-        return;
-      }
+      if (command === "off") {
+        const wasRunning = !ctx.isIdle();
 
-      if (lowerArgs === "research" || lowerArgs.startsWith("research ")) {
-        const researchPrompt = trimmedArgs.replace(/^research\s*/i, "").trim();
-        runtime.autoresearchMode = true;
-        runtime.stagnation = computeStagnationSnapshot(workDir, runtime);
-        persistRuntimeState(ctx);
-        ctx.ui.notify("Autoresearch research checkpoint queued", "info");
-        pi.sendUserMessage(
-          `Autoresearch research checkpoint. Read autoresearch.md, autoresearch.ideas.md, and ${getResearchCheckpointPath(workDir)} if it exists. Summarize the repeated dead ends, use any available docs/web/code research tools to gather fresh external findings, write/update autoresearch.research.md, distill the best 1-3 new hypotheses into autoresearch.ideas.md, and only then decide whether one new experiment is justified. ${researchPrompt} ${BENCHMARK_GUARDRAIL}`.trim()
+        runtime.autoresearchMode = false;
+        runtime.dashboardExpanded = false;
+        runtime.autoResumeTurns = 0;
+        runtime.experimentsThisSession = 0;
+        runtime.lastRunChecks = null;
+        runtime.lastRunDuration = null;
+        runtime.runningExperiment = null;
+        cancelPendingResume(runtime);
+        stopDashboardServer();
+        clearSessionUi(ctx);
+        if (wasRunning) ctx.abort();
+        ctx.ui.notify(
+          wasRunning ? "Autoresearch mode OFF — aborting current run" : "Autoresearch mode OFF",
+          "info"
         );
         return;
       }
 
-      if (lowerArgs === "off") {
-        runtime.autoresearchMode = false;
-        runtime.lastAutoResumeTime = 0;
-        runtime.autoResumeTurns = 0;
-        runtime.experimentsThisSession = 0;
-        runtime.lastRunChecks = null;
-        runtime.runningExperiment = null;
-        runtime.recoveryNotice = null;
-        stopDashboardServer();
-        persistRuntimeState(ctx);
-        ctx.ui.notify("Autoresearch mode OFF", "info");
-        return;
-      }
-
-      if (lowerArgs === "export") {
+      if (command === "export") {
         await exportDashboard(ctx);
         return;
       }
 
-      if (lowerArgs === "clear") {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
-        const runtimeStatePath = getRuntimeStatePath(workDir);
+      if (command === "clear") {
+        const jsonlPath = autoresearchJsonlPath(resolveWorkDir(ctx.cwd));
         runtime.autoresearchMode = false;
         runtime.dashboardExpanded = false;
-        runtime.lastAutoResumeTime = 0;
         runtime.autoResumeTurns = 0;
         runtime.experimentsThisSession = 0;
         runtime.lastRunChecks = null;
         runtime.runningExperiment = null;
-        runtime.recoveryNotice = null;
+        cancelPendingResume(runtime);
         runtime.state = createExperimentState();
         stopDashboardServer();
         updateWidget(ctx);
 
-        for (const filePath of [jsonlPath, runtimeStatePath]) {
-          if (fs.existsSync(filePath)) {
-            try {
-              fs.unlinkSync(filePath);
-            } catch (error) {
-              ctx.ui.notify(
-                `Failed to delete ${path.basename(filePath)}: ${error instanceof Error ? error.message : String(error)}`,
-                "error"
-              );
-              return;
-            }
+        if (fs.existsSync(jsonlPath)) {
+          try {
+            fs.unlinkSync(jsonlPath);
+            ctx.ui.notify("Deleted autoresearch.jsonl and turned autoresearch mode OFF", "info");
+          } catch (error) {
+            ctx.ui.notify(
+              `Failed to delete autoresearch.jsonl: ${error instanceof Error ? error.message : String(error)}`,
+              "error"
+            );
           }
+        } else {
+          ctx.ui.notify("No autoresearch.jsonl found. Autoresearch mode OFF", "info");
         }
-
-        ctx.ui.notify("Deleted autoresearch.jsonl and autoresearch.state.json. Autoresearch mode OFF", "info");
         return;
       }
-
-      const isResume = lowerArgs === "resume" || lowerArgs.startsWith("resume ");
-      const userPrompt = isResume ? trimmedArgs.replace(/^resume\s*/i, "").trim() : trimmedArgs;
 
       if (runtime.autoresearchMode) {
         ctx.ui.notify("Autoresearch already active — use '/autoresearch off' to stop first", "info");
@@ -3384,21 +3020,30 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       runtime.autoresearchMode = true;
       runtime.autoResumeTurns = 0;
-      runtime.recoveryNotice = null;
-      persistRuntimeState(ctx);
 
-      const mdPath = path.join(workDir, "autoresearch.md");
-      const hasRules = fs.existsSync(mdPath);
+      const workDir = resolveWorkDir(ctx.cwd);
+      const rulesLoaded = hasAutoresearchRules(ctx);
+      const kickoff = rulesLoaded
+        ? `Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
+        : `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`;
 
-      if (hasRules) {
-        ctx.ui.notify("Autoresearch mode ON — rules loaded from autoresearch.md", "info");
-        pi.sendUserMessage(`Autoresearch mode active. ${userPrompt || "Resume the saved experiment loop."} ${BENCHMARK_GUARDRAIL}`);
-      } else {
-        ctx.ui.notify("Autoresearch mode ON — no autoresearch.md found, setting up", "info");
-        pi.sendUserMessage(
-          `Start autoresearch: ${userPrompt} ${BENCHMARK_GUARDRAIL}`
-        );
-      }
+      ctx.ui.notify(
+        rulesLoaded
+          ? "Autoresearch mode ON — rules loaded from autoresearch.md"
+          : "Autoresearch mode ON — no autoresearch.md found, setting up",
+        "info",
+      );
+
+      const state = runtime.state;
+      const activationSteer = await fireHook({
+        event: "before",
+        cwd: workDir,
+        next_run: state.results.length + 1,
+        last_run: readLastRun(workDir),
+        session: buildSessionSnapshot(state),
+      });
+
+      sendWhenReady(ctx, activationSteer ? `${activationSteer}\n\n${kickoff}` : kickoff);
     },
   });
 }

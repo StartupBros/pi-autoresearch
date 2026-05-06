@@ -15,14 +15,14 @@ Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). W
 
 ---
 
-![pi-autoresearch dashboard](pi-autoresearch.png)
+<img width="1736" height="518" alt="pi-autoresearch" src="https://github.com/user-attachments/assets/5078aa31-3530-406a-85fc-bdeff98679a6" />
 
 ---
 
 ## Quick start
 
 ```bash
-pi install https://github.com/davebcn87/pi-autoresearch
+pi install npm:pi-autoresearch
 ```
 
 ## What's included
@@ -45,11 +45,8 @@ pi install https://github.com/davebcn87/pi-autoresearch
 | Subcommand | Description |
 |------------|-------------|
 | `/autoresearch <text>` | Enter autoresearch mode. If `autoresearch.md` exists, resumes the loop with `<text>` as context. Otherwise, sets up a new session. |
-| `/autoresearch resume [text]` | Re-enter autoresearch mode using existing session files and optionally provide fresh steering context. |
-| `/autoresearch research [text]` | Force a research-checkpoint turn: summarize stagnation, gather external findings, update `autoresearch.research.md`, and only then justify a new experiment. |
-| `/autoresearch status` | Show current mode, worktree/git health, persisted state, stagnation state, and current progress summary. |
 | `/autoresearch off` | Leave autoresearch mode. Stops auto-resume and clears runtime state but keeps `autoresearch.jsonl` intact. |
-| `/autoresearch clear` | Delete `autoresearch.jsonl` and `autoresearch.state.json`, reset all state, and turn autoresearch mode off. Use this for a clean start. |
+| `/autoresearch clear` | Delete `autoresearch.jsonl`, reset all state, and turn autoresearch mode off. Use this for a clean start. |
 | `/autoresearch export` | Open a live dashboard in your browser. Auto-updates as experiments run. |
 
 **Examples:**
@@ -64,17 +61,32 @@ pi install https://github.com/davebcn87/pi-autoresearch
 
 ### Keyboard shortcuts
 
-| Shortcut | Description |
-|----------|-------------|
-| `Ctrl+X` | Toggle dashboard expand/collapse (inline widget ↔ full results table above the editor) |
-| `Ctrl+Shift+X` | Open fullscreen scrollable dashboard overlay. Navigate with `↑`/`↓`/`j`/`k`, `PageUp`/`PageDown`/`u`/`d`, `g`/`G` for top/bottom, `Escape` or `q` to close. |
+| Shortcut     | Description |
+|--------------|-------------|
+| `Ctrl+Shift+T` | Toggle dashboard expand/collapse (inline widget ↔ full results table above the editor) |
+| `Ctrl+Shift+F` | Open fullscreen scrollable dashboard overlay. Navigate with `↑`/`↓`/`j`/`k`, `PageUp`/`PageDown`/`u`/`d`, `g`/`G` for top/bottom, `Escape` or `q` to close. |
+
+To avoid conflicts with other pi extensions, override or disable these shortcuts in
+`<agent-dir>/extensions/pi-autoresearch.json`. `<agent-dir>` is the active pi profile
+config directory (usually `~/.pi/agent`, or `PI_CODING_AGENT_DIR` when set):
+
+```json
+{
+  "shortcuts": {
+    "toggleDashboard": "ctrl+shift+y",
+    "fullscreenDashboard": null
+  }
+}
+```
+
+Use `null` to skip registering a shortcut. Omitted shortcuts keep their defaults.
 
 ### UI
 
 - **Status widget** — always visible above the editor: `🔬 autoresearch 12 runs 8 kept │ ★ total_µs: 15,200 (-12.3%) │ conf: 2.1×`
 - **Confidence score** — after 3+ runs, shows how the best improvement compares to the session noise floor. ≥2.0× (green) = likely real, 1.0–2.0× (yellow) = above noise but marginal, <1.0× (red) = within noise.
-- **Expanded dashboard** — `Ctrl+X` expands the widget into a full results table with columns for commit, metric, status, and description.
-- **Fullscreen overlay** — `Ctrl+Shift+X` opens a scrollable full-terminal dashboard. Shows a live spinner with elapsed time for running experiments.
+- **Expanded dashboard** — `Ctrl+Shift+T` expands the widget into a full results table with columns for commit, metric, status, and description.
+- **Fullscreen overlay** — `Ctrl+Shift+F` opens a scrollable full-terminal dashboard. Shows a live spinner with elapsed time for running experiments.
 
 ### Skills
 
@@ -82,21 +94,21 @@ pi install https://github.com/davebcn87/pi-autoresearch
 
 **`autoresearch-finalize`** turns a noisy autoresearch branch into clean, independent branches — one per logical change, each starting from the merge-base. Groups must not share files, so each branch can be reviewed and merged independently.
 
+**`autoresearch-hooks`** *(optional)* helps author `autoresearch.hooks/before.sh` and `autoresearch.hooks/after.sh` for a session. It ships with ten reference scripts in [`skills/autoresearch-hooks/examples/`](skills/autoresearch-hooks/examples/) (external search, learnings journal, native notifications, anti-thrash, idea rotation, and more) — the skill handles the contract, you pick the inspiration. The core autoresearch loop has no hook awareness.
+
 | File | Purpose |
 |------|---------|
 | `autoresearch.md` | Session document — objective, metrics, files in scope, what's been tried. A fresh agent can resume from this alone. |
 | `autoresearch.sh` | Benchmark script — pre-checks, runs the workload, outputs `METRIC name=number` lines. |
 | `autoresearch.checks.sh` | *(optional)* Backpressure checks — tests, types, lint. Runs after each passing benchmark. Failures block `keep`. |
-| `autoresearch.state.json` | Lightweight runtime snapshot — mode, git/worktree health, running command, recovery hints, stagnation state, and progress summary for crash/reload-safe resume. |
-| `autoresearch.lessons.jsonl` | Structured memory of reusable lessons from experiment runs — hypotheses, learnings, rollback reasons, and next-action hints that survive reverts. |
-| `autoresearch.research.md` | Research-checkpoint notes — repeated dead ends, external findings, and fresh hypotheses to try when the local search stagnates. |
+| `autoresearch.hooks/` | *(optional)* Executable scripts (`before.sh`, `after.sh`) that fire around iterations. Stdout is delivered to the agent as a steer message. |
 
 ---
 
 ## Install
 
 ```bash
-pi install https://github.com/davebcn87/pi-autoresearch
+pi install npm:pi-autoresearch
 ```
 
 <details>
@@ -145,8 +157,8 @@ The agent reads `autoresearch.jsonl`, groups kept experiments into logical chang
 ### 4. Monitor progress
 
 - **Widget** — always visible above the editor
-- **`Ctrl+X`** — expand/collapse the full results table inline
-- **`Ctrl+Shift+X`** — fullscreen scrollable dashboard overlay
+- **`Ctrl+Shift+T`** — expand/collapse the full results table inline (config key: `shortcuts.toggleDashboard`)
+- **`Ctrl+Shift+F`** — fullscreen scrollable dashboard overlay (config key: `shortcuts.fullscreenDashboard`)
 - **`/autoresearch export`** — open a live browser dashboard with chart and share card
 - **`Escape`** — interrupt anytime and ask for a summary
 
@@ -179,17 +191,14 @@ The **extension** is domain-agnostic infrastructure. The **skill** encodes domai
 └──────────────────────┘     └──────────────────────────┘
 ```
 
-Five files keep the session alive across restarts, stagnation pivots, and context resets:
+Two files keep the session alive across restarts and context resets:
 
 ```
-autoresearch.jsonl        — append-only log of every run (metric, status, commit, description)
-autoresearch.md           — living document: objective, what's been tried, dead ends, key wins
-autoresearch.state.json   — crash/reload-safe runtime snapshot (mode, git/worktree status, running command)
-autoresearch.lessons.jsonl — structured reusable lessons from prior runs
-autoresearch.research.md  — research-checkpoint findings and fresh hypotheses when local search stalls
+autoresearch.jsonl   — append-only log of every run (metric, status, commit, description)
+autoresearch.md      — living document: objective, what's been tried, dead ends, key wins
 ```
 
-A fresh agent with no memory can read these files and continue exactly where the previous session left off, while `autoresearch.state.json` helps detect interrupted runs, `autoresearch.lessons.jsonl` preserves durable strategy memory across reverts, and `autoresearch.research.md` captures the external-research pivot when the loop stagnates.
+A fresh agent with no memory can read these two files and continue exactly where the previous session left off.
 
 ---
 
@@ -208,6 +217,10 @@ Create `autoresearch.config.json` in your pi session directory to customize beha
 |-------|------|-------------|
 | `workingDir` | string | Override the directory for all autoresearch operations — file I/O, command execution, and git. Supports absolute or relative paths (resolved against the pi session cwd). The config file itself always stays in the session cwd. Fails if the directory doesn't exist. |
 | `maxIterations` | number | Maximum experiments before auto-stopping. The agent is told to stop and won't run more experiments until a new segment is initialized. |
+
+### Long-running loops and context
+
+The loop is designed to run unattended across context limits. When pi's [auto-compaction](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/compaction.md) summarizes the older portion of the conversation, autoresearch detects the resulting idle and re-prompts the agent to re-read `autoresearch.md`, the tail of `autoresearch.jsonl`, `autoresearch.ideas.md`, and `git log` before continuing. All progress is persisted in those files, so the post-summary turn rehydrates from the source of truth instead of relying on whatever survived compaction. No tuning required — if pi's auto-compaction is enabled (the default), this just works.
 
 ---
 
@@ -250,6 +263,62 @@ pnpm typecheck
 - If checks fail, the experiment is logged as `checks_failed` (same behavior as a crash — no commit, revert changes).
 - The `checks_failed` status is shown separately in the dashboard so you can distinguish correctness failures from benchmark crashes.
 - Checks have a separate timeout (default 300s, configurable via `checks_timeout_seconds` in `run_experiment`).
+
+---
+
+## Hooks (optional)
+
+Drop executable scripts in `autoresearch.hooks/` to run code at iteration boundaries. Hooks are **transparent to the agent** — the agent calls tools and sees results; hooks run alongside without any agent-facing surface.
+
+- `autoresearch.hooks/before.sh` — fires before every iteration (at `/autoresearch` activation and at the end of every `log_experiment`, after `after.sh`). Use for prospective work: fetch research, prime context for the next attempt.
+- `autoresearch.hooks/after.sh` — fires at the end of every `log_experiment`. Use for retrospective work: annotate learnings, send notifications.
+
+**Contract:**
+
+- Must be executable (`chmod +x`). Preserved on revert like all `autoresearch.*` artefacts.
+- **Stdin** — a JSON object on a single line. Shape depends on the stage (see below). Extract fields with `jq`.
+- **Stdout** is delivered to the agent as a steer message (capped at 8 KB). Empty stdout = silent.
+- Non-zero exit or >30s timeout surfaces an error steer to the agent.
+- Each fire appends a `{"type":"hook",…}` entry to `autoresearch.jsonl` for observability.
+
+**`before.sh` stdin** (on fresh activation `last_run` is `null`):
+
+```json
+{
+  "event": "before",
+  "cwd": "/path/to/workdir",
+  "next_run": 6,
+  "last_run": {
+    "run": 5, "status": "discard", "metric": 42.1,
+    "description": "…",
+    "asi": { "hypothesis": "…", "next_focus": "…" }
+  },
+  "session": {
+    "metric_name": "total_ms", "metric_unit": "ms", "direction": "lower",
+    "baseline_metric": 40.7, "best_metric": 33.5,
+    "run_count": 5, "goal": "optimize sort speed"
+  }
+}
+```
+
+**`after.sh` stdin:**
+
+```json
+{
+  "event": "after",
+  "cwd": "/path/to/workdir",
+  "run_entry": {
+    "run": 6, "status": "discard", "metric": 38.9,
+    "description": "…",
+    "asi": { "hypothesis": "…", "learned": "…" }
+  },
+  "session": { "metric_name": "total_ms", "direction": "lower", "baseline_metric": 40.7, "best_metric": 33.5, "run_count": 6, "goal": "…" }
+}
+```
+
+**Agent signal.** The agent writes `description` and `asi.*` fields in its `log_experiment` calls for its own future-self reasoning. The hook opportunistically mines whichever fields the agent naturally uses — `asi.hypothesis`, `asi.next_focus`, `description`, etc. There is no dedicated "hook input" field; the agent is unaware the hook exists.
+
+**Examples.** Reference scripts for both stages live at [`skills/autoresearch-hooks/examples/`](skills/autoresearch-hooks/examples/) — external search, qmd document search, persistent learnings, native notifications, git tagging, anti-thrash, idea rotator, hypothesis reflection, context rotation. Copy one to your session's `autoresearch.hooks/` directory, adapt, `chmod +x`.
 
 ---
 
