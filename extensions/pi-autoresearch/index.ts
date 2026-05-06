@@ -1285,6 +1285,7 @@ function renderDashboardLines(
 // ---------------------------------------------------------------------------
 
 export default function autoresearchExtension(pi: ExtensionAPI) {
+  const isHeadlessJson = process.argv.includes("--mode") && process.argv.includes("json") || process.argv.some((arg) => arg === "--mode=json");
   const MAX_AUTORESUME_TURNS = 20;
   const BENCHMARK_GUARDRAIL =
     "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
@@ -1331,8 +1332,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
   const clearSessionUi = (ctx: ExtensionContext) => {
     clearOverlay();
-    if (ctx.hasUI) {
-      ctx.ui.setWidget("autoresearch", undefined);
+    try {
+      if (ctx.hasUI) {
+        ctx.ui.setWidget("autoresearch", undefined);
+      }
+    } catch {
+      // Ignore stale/headless UI contexts after session replacement.
     }
   };
 
@@ -1500,6 +1505,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   };
 
   const updateWidget = (ctx: ExtensionContext) => {
+    try {
     if (!ctx.hasUI) return;
 
     const runtime = getRuntime(ctx);
@@ -1659,8 +1665,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         invalidate(): void {},
       }));
     }
+    } catch {
+      // Ignore stale/headless UI contexts after session replacement.
+    }
   };
 
+  if (!isHeadlessJson) {
   pi.on("session_start", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_tree", async (_e, ctx) => reconstructState(ctx));
   pi.on("session_before_switch", async () => {
@@ -1672,7 +1682,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtimeStore.clear(getSessionKey(ctx));
     stopDashboardServer();
   });
+  }
 
+  if (!isHeadlessJson) {
   // Reset per-session experiment counter when agent starts
   pi.on("agent_start", async (_event, ctx) => {
     getRuntime(ctx).experimentsThisSession = 0;
@@ -1729,7 +1741,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     persistRuntimeState(ctx);
     pi.sendUserMessage(resumeMsg);
   });
+  }
 
+  if (!isHeadlessJson) {
   // When in autoresearch mode, add a static note to the system prompt.
   // Only a short pointer — no file content, fully cache-safe.
   pi.on("before_agent_start", async (event, ctx) => {
@@ -1801,6 +1815,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       systemPrompt: event.systemPrompt + extra,
     };
   });
+  }
 
   // -----------------------------------------------------------------------
   // init_experiment tool — one-time setup
