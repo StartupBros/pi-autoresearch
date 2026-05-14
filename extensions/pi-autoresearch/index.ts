@@ -428,6 +428,55 @@ function currentResults(results: ExperimentResult[], segment: number): Experimen
   return results.filter((r) => r.segment === segment);
 }
 
+function flattenStrings(value: unknown, out: string[] = []): string[] {
+  if (typeof value === "string") {
+    out.push(value);
+  } else if (Array.isArray(value)) {
+    for (const item of value) flattenStrings(item, out);
+  } else if (value && typeof value === "object") {
+    for (const item of Object.values(value as Record<string, unknown>)) flattenStrings(item, out);
+  }
+  return out;
+}
+
+function experimentDiagnosticText(result: ExperimentResult): string {
+  return [result.description, ...flattenStrings(result.asi)].join("\n").toLowerCase();
+}
+
+function crashSignature(result: ExperimentResult): string | null {
+  if (result.status !== "crash" && result.status !== "checks_failed") return null;
+  const text = experimentDiagnosticText(result);
+
+  if (text.includes("negative project balance")) return "negative-project-balance";
+  if (text.includes("precondition required")) return "precondition-required";
+  if (text.includes("no batch id returned")) return "no-batch-id";
+
+  return text
+    .replace(/\b\d+(?:\.\d+)?\b/g, "#")
+    .replace(/[a-f0-9]{7,}/g, "#")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240) || null;
+}
+
+export function autoPauseReasonAfterExperiment(results: ExperimentResult[], segment: number, experiment: ExperimentResult): string | null {
+  const signature = crashSignature(experiment);
+  if (!signature) return null;
+
+  if (["negative-project-balance", "precondition-required", "no-batch-id"].includes(signature)) {
+    return `non-retryable infrastructure crash detected (${signature})`;
+  }
+
+  let repeats = 0;
+  for (const result of [...currentResults(results, segment)].reverse()) {
+    if (crashSignature(result) !== signature) break;
+    repeats += 1;
+  }
+
+  if (repeats >= 3) return `same crash repeated ${repeats} times (${signature})`;
+  return null;
+}
+
 interface AutoresearchConfig {
   maxIterations?: number;
   workingDir?: string;
@@ -1519,6 +1568,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     let extra =
       "\n\n## Autoresearch Mode (ACTIVE)" +
       "\nYou are in autoresearch mode. Optimize the primary metric through an autonomous experiment loop." +
+      `\nCurrent Pi cwd: ${ctx.cwd}` +
+      `\nConfigured autoresearch workDir: ${workDir}` +
+      "\nIf the user's current request is not about this autoresearch workDir, pause and ask before running experiments." +
       "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
       `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
       "\nWrite promising but deferred optimizations as bullet points to autoresearch.ideas.md — don't let good ideas get lost." +
@@ -2444,8 +2496,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.lastRunChecks = null;
       runtime.lastRunDuration = null;
 
+      const pauseReason = autoPauseReasonAfterExperiment(state.results, state.currentSegment, experiment);
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
-      if (limitReached) {
+      if (pauseReason) {
+        text += `\n\n🛑 Autoresearch auto-resume paused: ${pauseReason}. Fix the blocker, then explicitly run /autoresearch again to continue.`;
+        runtime.autoresearchMode = false;
+        cancelPendingResume(runtime);
+        ctx.abort();
+      } else if (limitReached) {
         text += `\n\n🛑 Maximum experiments reached (${state.maxExperiments}). STOP the experiment loop now.`;
         runtime.autoresearchMode = false;
         ctx.abort();
