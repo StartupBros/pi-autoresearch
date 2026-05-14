@@ -215,7 +215,7 @@ Create `autoresearch.config.json` in your pi session directory to customize beha
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `workingDir` | string | Override the directory for all autoresearch operations — file I/O, command execution, and git. Supports absolute or relative paths (resolved against the pi session cwd). The config file itself always stays in the session cwd. Fails if the directory doesn't exist. |
+| `workingDir` | string | Override the directory for all autoresearch operations — file I/O, command execution, and git. Supports absolute or relative paths (resolved against the pi session cwd). The config file itself always stays in the session cwd. Fails if the directory doesn't exist. A redirected `workingDir` does **not** auto-resume from an unrelated cwd; run `/autoresearch resume` explicitly to continue it. |
 | `maxIterations` | number | Maximum experiments before auto-stopping. The agent is told to stop and won't run more experiments until a new segment is initialized. |
 
 ### Long-running loops and context

@@ -477,6 +477,11 @@ export function autoPauseReasonAfterExperiment(results: ExperimentResult[], segm
   return null;
 }
 
+export function shouldAutoEnterAutoresearch(ctxCwd: string, workDir: string, hasPersistedLog: boolean): boolean {
+  if (!hasPersistedLog) return false;
+  return path.resolve(ctxCwd) === path.resolve(workDir);
+}
+
 interface AutoresearchConfig {
   maxIterations?: number;
   workingDir?: string;
@@ -1327,8 +1332,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     // Read max experiments from config file
     state.maxExperiments = readMaxExperiments(ctx.cwd);
 
-    // Auto-enter autoresearch mode only when a persisted experiment log exists
-    runtime.autoresearchMode = fs.existsSync(autoresearchJsonlPath(workDir));
+    // Auto-enter only when the persisted log belongs to the current cwd. If
+    // autoresearch.config.json points elsewhere, require an explicit
+    // /autoresearch invocation so stale broad-cwd configs cannot hijack an
+    // unrelated session.
+    const hasPersistedLog = fs.existsSync(autoresearchJsonlPath(workDir));
+    runtime.autoresearchMode = shouldAutoEnterAutoresearch(ctx.cwd, workDir, hasPersistedLog);
+    if (hasPersistedLog && !runtime.autoresearchMode && ctx.hasUI) {
+      ctx.ui.notify(
+        `Autoresearch log found in configured workDir (${workDir}) but cwd is ${ctx.cwd}; not auto-resuming. Run /autoresearch resume to continue it explicitly.`,
+        "info",
+      );
+    }
 
     updateWidget(ctx);
   };
