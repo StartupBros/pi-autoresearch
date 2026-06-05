@@ -1,15 +1,16 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { KeyId } from "@earendil-works/pi-tui";
 
-export const DEFAULT_TOGGLE_DASHBOARD_SHORTCUT = "ctrl+shift+t";
-export const DEFAULT_FULLSCREEN_DASHBOARD_SHORTCUT = "ctrl+shift+f";
+export const DEFAULT_TOGGLE_DASHBOARD_SHORTCUT = "ctrl+shift+t" as const satisfies KeyId;
+export const DEFAULT_FULLSCREEN_DASHBOARD_SHORTCUT = "ctrl+shift+f" as const satisfies KeyId;
 
 const CONFIG_FILE_NAME = "pi-autoresearch.json";
 
 export interface AutoresearchShortcuts {
-  toggleDashboard: string | null;
-  fullscreenDashboard: string | null;
+  toggleDashboard: KeyId | null;
+  fullscreenDashboard: KeyId | null;
 }
 
 interface AutoresearchShortcutConfig {
@@ -86,9 +87,9 @@ function isValidShortcutConfigValue(value: unknown): value is string | null | un
   );
 }
 
-function shortcutFromConfig(configured: unknown, fallback: string): string | null {
+function shortcutFromConfig(configured: unknown, fallback: KeyId): KeyId | null {
   if (configured === null) return null;
-  return typeof configured === "string" ? configured : fallback;
+  return typeof configured === "string" ? configured as KeyId : fallback;
 }
 
 function defaultAutoresearchShortcuts(): AutoresearchShortcuts {
